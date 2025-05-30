@@ -5,7 +5,7 @@
 
 include $(TOPDIR)/rules.mk
 
-PKG_NAME:=openwisp-monitoring
+PKG_NAME:=nexapp-monitoring
 PKG_VERSION:=$(shell cat ../VERSION)
 PKG_RELEASE:=1
 PKG_BUILD_DIR:=$(BUILD_DIR)/$(PKG_NAME)/$(PKG_SOURCE_SUBDIR)
@@ -14,8 +14,8 @@ PKG_LICENSE:=GPL-3.0-or-later
 
 include $(INCLUDE_DIR)/package.mk
 
-define Package/openwisp-monitoring
-	TITLE:=OpenWISP Monitoring agent
+define Package/nexapp-monitoring
+	TITLE:=Nexapp Monitoring agent
 	CATEGORY:=Administration
 	SECTION:=admin
 	SUBMENU:=openwisp
@@ -42,16 +42,16 @@ endef
 define Build/Compile
 endef
 
-define Package/openwisp-monitoring/conffiles
-/etc/config/openwisp-monitoring
+define Package/nexapp-monitoring/conffiles
+/etc/config/nexapp-monitoring
 endef
 
 define Package/netjson-monitoring/install
 	$(INSTALL_DIR) \
 		$(1)/usr/sbin \
 		$(1)/usr/libexec \
-		$(1)/usr/lib/lua/openwisp-monitoring \
-		$(1)/usr/lib/openwisp-monitoring
+		$(1)/usr/lib/lua/nexapp-monitoring \
+		$(1)/usr/lib/nexapp-monitoring
 
 	$(INSTALL_BIN) \
 		files/sbin/netjson-monitoring.lua \
@@ -62,64 +62,64 @@ define Package/netjson-monitoring/install
 		$(1)/usr/sbin/netjson-monitoring
 
 	$(INSTALL_DATA) \
-		files/lib/openwisp-monitoring/dhcp.lua \
-		$(1)/usr/lib/lua/openwisp-monitoring/dhcp.lua
+		files/lib/nexapp-monitoring/dhcp.lua \
+		$(1)/usr/lib/lua/nexapp-monitoring/dhcp.lua
 
 	$(INSTALL_DATA) \
-		files/lib/openwisp-monitoring/interfaces.lua \
-		$(1)/usr/lib/lua/openwisp-monitoring/interfaces.lua
+		files/lib/nexapp-monitoring/interfaces.lua \
+		$(1)/usr/lib/lua/nexapp-monitoring/interfaces.lua
 
 	$(INSTALL_DATA) \
-		files/lib/openwisp-monitoring/monitoring.lua \
-		$(1)/usr/lib/lua/openwisp-monitoring/monitoring.lua
+		files/lib/nexapp-monitoring/monitoring.lua \
+		$(1)/usr/lib/lua/nexapp-monitoring/monitoring.lua
 
 	$(INSTALL_DATA) \
-		files/lib/openwisp-monitoring/utils.lua \
-		$(1)/usr/lib/lua/openwisp-monitoring/utils.lua
+		files/lib/nexapp-monitoring/utils.lua \
+		$(1)/usr/lib/lua/nexapp-monitoring/utils.lua
 
 	$(INSTALL_DATA) \
-		files/lib/openwisp-monitoring/neighbors.lua \
-		$(1)/usr/lib/lua/openwisp-monitoring/neighbors.lua
+		files/lib/nexapp-monitoring/neighbors.lua \
+		$(1)/usr/lib/lua/nexapp-monitoring/neighbors.lua
 
 	$(INSTALL_DATA) \
-		files/lib/openwisp-monitoring/resources.lua \
-		$(1)/usr/lib/lua/openwisp-monitoring/resources.lua
+		files/lib/nexapp-monitoring/resources.lua \
+		$(1)/usr/lib/lua/nexapp-monitoring/resources.lua
 
 	$(INSTALL_DATA) \
-		files/lib/openwisp-monitoring/wifi.lua \
-		$(1)/usr/lib/lua/openwisp-monitoring/wifi.lua
+		files/lib/nexapp-monitoring/wifi.lua \
+		$(1)/usr/lib/lua/nexapp-monitoring/wifi.lua
 
 # Iwinfo is enabled by default unless specified otherwise
 ifeq ($(CONFIG_NETJSON_MONITORING_IWINFO), y)
-	$(CP) files/lib/openwisp-monitoring/iwinfo.lua $(1)/usr/lib/lua/openwisp-monitoring/iwinfo.lua
+	$(CP) files/lib/nexapp-monitoring/iwinfo.lua $(1)/usr/lib/lua/nexapp-monitoring/iwinfo.lua
 endif
 
-	$(CP) ../VERSION $(1)/usr/lib/openwisp-monitoring/
+	$(CP) ../VERSION $(1)/usr/lib/nexapp-monitoring/
 endef
 
-define Package/openwisp-monitoring/install
+define Package/nexapp-monitoring/install
 	$(INSTALL_DIR) \
 		$(1)/usr/sbin \
 		$(1)/etc/init.d \
 		$(1)/etc/config \
-		$(1)/usr/lib/openwisp-monitoring \
-		$(1)/etc/hotplug.d/openwisp
+		$(1)/usr/lib/nexapp-monitoring \
+		$(1)/etc/hotplug.d/nexapp
 
 	$(INSTALL_BIN) \
 		files/monitoring.agent \
-		$(1)/usr/sbin/openwisp-monitoring
+		$(1)/usr/sbin/nexapp-monitoring
 
 	$(INSTALL_BIN) \
 		files/monitoring.init \
-		$(1)/etc/init.d/openwisp-monitoring
+		$(1)/etc/init.d/nexapp-monitoring
 
 	$(INSTALL_BIN) \
-		files/openwisp-monitoring.hotplug \
-		$(1)/etc/hotplug.d/openwisp/openwisp-monitoring
+		files/nexapp-monitoring.hotplug \
+		$(1)/etc/hotplug.d/openwisp/nexapp-monitoring
 
 	$(INSTALL_CONF) \
 		files/monitoring.config \
-		$(1)/etc/config/openwisp-monitoring
+		$(1)/etc/config/nexapp-monitoring
 
 endef
 

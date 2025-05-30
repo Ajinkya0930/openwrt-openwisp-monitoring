@@ -11,7 +11,7 @@ local ubus_lib = require('ubus')
 local ubus = ubus_lib.connect()
 if not ubus then error('Failed to connect to ubusd') end
 
-local monitoring = require('openwisp-monitoring.monitoring')
+local monitoring = require('nexapp-monitoring.monitoring')
 
 -- collect system info
 local system_info = ubus:call('system', 'info', {})

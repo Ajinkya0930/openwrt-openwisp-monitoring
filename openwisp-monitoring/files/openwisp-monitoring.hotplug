@@ -4,5 +4,5 @@
 # agent boots up or is restarted.
 
 if [ "$ACTION" = "bootup" ] || [ "$ACTION" = "restart" ]; then
-	/etc/init.d/openwisp-monitoring restart
+	/etc/init.d/nexapp-monitoring restart
 fi

@@ -1,5 +1,5 @@
 -- retrieve dhcp leases
-local utils = require('openwisp-monitoring.utils')
+local utils = require('nexapp-monitoring.utils')
 local uci = require('uci')
 local uci_cursor = uci.cursor()
 local io = require('io')
