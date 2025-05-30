@@ -115,7 +115,7 @@ define Package/nexapp-monitoring/install
 
 	$(INSTALL_BIN) \
 		files/nexapp-monitoring.hotplug \
-		$(1)/etc/hotplug.d/openwisp/nexapp-monitoring
+		$(1)/etc/hotplug.d/nexapp/nexapp-monitoring
 
 	$(INSTALL_CONF) \
 		files/monitoring.config \
@@ -123,5 +123,5 @@ define Package/nexapp-monitoring/install
 
 endef
 
-$(eval $(call BuildPackage,openwisp-monitoring))
+$(eval $(call BuildPackage,nexapp-monitoring))
 $(eval $(call BuildPackage,netjson-monitoring))
