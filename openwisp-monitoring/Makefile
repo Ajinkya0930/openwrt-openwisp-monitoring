@@ -121,6 +121,10 @@ define Package/openwisp-monitoring/install
 		files/monitoring.config \
 		$(1)/etc/config/openwisp-monitoring
 
+	$(INSTALL_BIN) \
+		files/collect_dpi_client_data.py \
+		$(1)/usr/sbin/collect_dpi_client_data.py
+
 endef
 
 $(eval $(call BuildPackage,openwisp-monitoring))
