@@ -98,7 +98,7 @@ collect_dpi() {
 
     # Run the parser script
     [ "$VERBOSE_MODE" -eq 1 ] && logger -s "Running collect_dpi_client_data script........" -p daemon.info
-    /usr/bin/python3 /usr/bin/collect_dpi_client_data.py
+    /usr/bin/python3 /usr/sbin/collect_dpi_client_data.py
 
     # Log the newest output file
     LATEST_FILE=$(ls -t "${TMP_DIR}/dpi_summary_by_client"*.json.gz 2>/dev/null | head -n1)
@@ -155,36 +155,30 @@ collect_dpi() {
 # }
 
 #this function is used to make copy of /tmp/ns-report/ files and copied into /tmp/openwisp/monitoring/ dir 
-prepare_tsip_files() {                                                                                        
-                                                                                                                  
-    timestamp=$(date +"%Y%m%d_%H%M%S")                                                                          
-                                                                                                                      
-    filepath="${TMP_DIR}/tsip_combined_${timestamp}.json"                                                             
-                                                                                                              
-    # Fetch ubus responses                                                                                            
-                                                                                                                      
-    malware_report=$(ubus call ns.report tsip-malware-report 2>/dev/null)                                             
-                                                                                                                      
-    attack_report=$(ubus call ns.report tsip-attack-report 2>/dev/null)                                               
-                                                                                                                      
-    # Combine into one JSON object                                                            
-                                                                                                                      
-    echo "{" > "$filepath"                                                                                            
-                                                                                                          
-    echo " \"BlockList\": $malware_report," >> "$filepath"                                                            
-                                                                                                
-    echo " \"Brute Force Attack\": $attack_report" >> "$filepath"                                         
-                                                                                                                     
-    echo "}" >> "$filepath"                                                                                           
-                                                                                                
-	if jq -e 'if (. null) or (. {}) or (. == []) then empty else . end' "$filepath" > /dev/null 2>&1; then            
-		gzip -f "$filepath"                                                                                       
-		[ "$VERBOSE_MODE" -eq 1 ] && logger -s "Interface Traffic data save into $filepath" -p daemon.info        
-	else                                                                                                              
-		logger -s "Failed to collect Interface Traffic data via UBUS" -p daemon.error
-		return 1                                                                                                  
-	fi                                                                                                        
-                                                                                                                      
+prepare_tsip_files() {
+
+    timestamp=$(date +"%Y%m%d_%H%M%S")
+    filepath="${TMP_DIR}/tsip_combined_${timestamp}.json"
+
+    # Fetch ubus responses
+    malware_report=$(ubus call ns.report tsip-malware-report 2>/dev/null)
+    attack_report=$(ubus call ns.report tsip-attack-report 2>/dev/null)
+
+    # Combine into one JSON object
+    echo "{" > "$filepath"
+    echo " \"BlockList\": $malware_report," >> "$filepath"
+    echo " \"Brute Force Attack\": $attack_report" >> "$filepath"
+    echo "}" >> "$filepath"
+
+	if jq -e 'type == "object" and (keys | length > 0) or type == "array" and length > 0' "$filepath" > /dev/null 2>&1; then
+		gzip -f "$filepath"
+		[ "$VERBOSE_MODE" -eq 1 ] && logger -s "tsip report data saved into $filepath" -p daemon.info
+	else
+		logger -s "Failed to collect TSIP Report data via UBUS" -p daemon.error
+		return 1
+	fi
+
+
 }       
 
 #this function is used to read the real-time traffic tab data in file and send to controller
@@ -220,18 +214,25 @@ collect_wan_uplinks_data() {
 	echo "  \"public_ip_report\": $ip" >> "$filepath"
 	echo "}" >> "$filepath"
 
-	# Compress the file
-	gzip -f "$filepath"
+	if jq -e 'type == "object" and (keys | length > 0) or type == "array" and length > 0' "$filepath" > /dev/null 2>&1; then
+	    gzip -f "$filepath"
+	    [ "$VERBOSE_MODE" -eq 1 ] && logger -s "Interface List data saved into $filepath" -p daemon.info
+	else
+	    logger -s "Failed to collect Interface List data via UBUS" -p daemon.error
+	    return 1
+	fi
+
+
 	#-----------------------------------------------------------------------------------------------------
 
 	#Interfaces Events
 	filepath="${TMP_DIR}/interface_events_${timestamp}.json"
 	if ubus call ns.report mwan-report 2>/dev/null | sed 's/^[[:space:]]*//' > "$filepath"; then         
-        gzip -f "$filepath"                                                                                         
+        gzip -f "$filepath"
         [ "$VERBOSE_MODE" -eq 1 ] && logger -s "Interfaces Events data save into $filepath" -p daemon.info
-    else                                                                                                                
+    else
         logger -s "Failed to collect latency and quality reports data via UBUS" -p daemon.error                     
-        return 1                                                                                                    
+        return 1
     fi
 	#----------------------------------------------------------------------------------------------------
 
@@ -257,13 +258,14 @@ collect_wan_uplinks_data() {
 	# Close JSON object
 	echo "}" >> "$filepath"
 
-	if jq -e 'if (. == null) or (. == {}) or (. == []) then empty else . end' "$filepath" > /dev/null 2>&1; then
-		gzip -f "$filepath"                                                                                                            
-		[ "$VERBOSE_MODE" -eq 1 ] && logger -s "Interface Traffic data save into $filepath" -p daemon.info
+	if jq -e 'type == "object" and (keys | length > 0) or type == "array" and length > 0' "$filepath" > /dev/null 2>&1; then
+	    gzip -f "$filepath"
+	    [ "$VERBOSE_MODE" -eq 1 ] && logger -s "Interface Traffic data saved into $filepath" -p daemon.info
 	else
-		logger -s "Failed to collect Interface Traffic  data via UBUS" -p daemon.error                                        
-		return 1
+	    logger -s "Failed to collect Interface Traffic data via UBUS" -p daemon.error
+	    return 1
 	fi
+
 	#-----------------------------------------------------------------------------------------------------------
 
 	# Run this ubus command to get the latency and quality reports from the wan-uplinks tab.
@@ -271,9 +273,9 @@ collect_wan_uplinks_data() {
 	if ubus call ns.report latency-and-quality-report 2>/dev/null | sed 's/^[[:space:]]*//' > "$filepath"; then
 	gzip -f "$filepath"
 	[ "$VERBOSE_MODE" -eq 1 ] && logger -s " Latency and quality report data save into $filepath" -p daemon.info
-	else                                                                                                
-    	logger -s "Failed to collect latency and quality reports data via UBUS" -p daemon.error                                               
-    	return 1                                                                                                          
+	else
+    	logger -s "Failed to collect latency and quality reports data via UBUS" -p daemon.error
+    	return 1
 	fi
 
 }

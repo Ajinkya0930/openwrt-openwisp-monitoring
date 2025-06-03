@@ -6,13 +6,13 @@ import gzip
 import logging 
 
 
-logging.basicConfig(filename='/tmp/nexapp_monitoring.log', level=logging.INFO)
+logging.basicConfig(filename='/tmp/openwisp_monitoring.log', level=logging.INFO)
 logging.info(f'Script run at {datetime.now()}')
 
 
 # Paths
 base_dir = Path("/var/run/dpireport")
-output_dir = Path("/tmp/nexapp/monitoring")
+output_dir = Path("/tmp/openwisp/monitoring")
 output_dir.mkdir(parents=True, exist_ok=True)
 
 # Get current hour timestamp for file naming and existence check
