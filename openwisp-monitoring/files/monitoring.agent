@@ -167,7 +167,7 @@ prepare_tsip_files() {
     # Combine into one JSON object
     echo "{" > "$filepath"
     echo " \"BlockList\": $malware_report," >> "$filepath"
-    echo " \"Brute Force Attack\": $attack_report" >> "$filepath"
+    echo " \"Brute_Force_Attack\": $attack_report" >> "$filepath"
     echo "}" >> "$filepath"
 
 	if jq -e 'type == "object" and (keys | length > 0) or type == "array" and length > 0' "$filepath" > /dev/null 2>&1; then
@@ -227,11 +227,11 @@ collect_wan_uplinks_data() {
 
 	#Interfaces Events
 	filepath="${TMP_DIR}/interface_events_${timestamp}.json"
-	if ubus call ns.report mwan-report 2>/dev/null | sed 's/^[[:space:]]*//' > "$filepath"; then         
+	if ubus call ns.report mwan-report 2>/dev/null | sed 's/^[[:space:]]*//' > "$filepath"; then
         gzip -f "$filepath"
         [ "$VERBOSE_MODE" -eq 1 ] && logger -s "Interfaces Events data save into $filepath" -p daemon.info
     else
-        logger -s "Failed to collect latency and quality reports data via UBUS" -p daemon.error                     
+        logger -s "Failed to collect latency and quality reports data via UBUS" -p daemon.error
         return 1
     fi
 	#----------------------------------------------------------------------------------------------------
@@ -366,8 +366,8 @@ send_data() {
 			# Determine endpoint based on filename prefix
 			if [[ "$basefilename" == dpi_summary_by_client_* ]]; then
 				endpoint="monitoring/device/$UUID/dpi_client_summary/"
-			elif [[ "$basefilename" == dpi_summary_v2_* ]]; then                                                               
-                                endpoint="monitoring/device/$UUID/dpi_summary_v2/" 
+			elif [[ "$basefilename" == dpi_summary_v2_* ]]; then
+                    endpoint="monitoring/device/$UUID/dpi_summary_v2/" 
 			elif [[ "$basefilename" == tsip_* ]]; then
     				endpoint="monitoring/device/$UUID/tsipreport/"
 			elif [[ "$basefilename" == real_time_traffic_data_* ]]; then
