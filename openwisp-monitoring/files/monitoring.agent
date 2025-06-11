@@ -81,94 +81,50 @@ collect_data() {
 
 #this function is used to collect dpi data of all clients and compose into single json file.
 collect_dpi() {
-    [ "$VERBOSE_MODE" -eq 1 ] && logger -s "Running DPI data collection via UBUS" -p daemon.info
+	[ "$VERBOSE_MODE" -eq 1 ] && logger -s "Running DPI data collection via UBUS" -p daemon.info
 
-    # Generate a timestamped filename
-    TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-    OUTPUT_FILE="${TMP_DIR}/dpi_summary_v2_${TIMESTAMP}.json.gz"
+	# Generate a timestamped filename
+	TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+	OUTPUT_FILE="${TMP_DIR}/dpi_summary_v2_${TIMESTAMP}.json.gz"
 
-    # Collect data using ubus and compress it into the output file
-    [ "$VERBOSE_MODE" -eq 1 ] && logger -s "Call ubus command for summary-v2 data collect...." -p daemon.info
-    if ubus call ns.dpireport summary-v2 2>/dev/null | gzip > "$OUTPUT_FILE"; then
-        [ "$VERBOSE_MODE" -eq 1 ] && logger -s "DPI data collected and saved to $OUTPUT_FILE" -p daemon.info
-    else
-        logger -s "Failed to collect DPI data via UBUS" -p daemon.error
-        return 1
-    fi
+	# Collect data using ubus and compress it into the output file
+	[ "$VERBOSE_MODE" -eq 1 ] && logger -s "Call ubus command for summary-v2 data collect...." -p daemon.info
+	if ubus call ns.dpireport summary-v2 2>/dev/null | gzip > "$OUTPUT_FILE"; then
+		[ "$VERBOSE_MODE" -eq 1 ] && logger -s "DPI data collected and saved to $OUTPUT_FILE" -p daemon.info
+	else
+		logger -s "Failed to collect DPI data via UBUS" -p daemon.error
+		return 1
+	fi
 
-    # Run the parser script
-    [ "$VERBOSE_MODE" -eq 1 ] && logger -s "Running collect_dpi_client_data script........" -p daemon.info
-    /usr/bin/python3 /usr/sbin/collect_dpi_client_data.py
+	# Run the parser script
+	[ "$VERBOSE_MODE" -eq 1 ] && logger -s "Running collect_dpi_client_data script........" -p daemon.info
+	/usr/bin/python3 /usr/sbin/collect_dpi_client_data.py
 
-    # Log the newest output file
-    LATEST_FILE=$(ls -t "${TMP_DIR}/dpi_summary_by_client"*.json.gz 2>/dev/null | head -n1)
-    if [ -n "$LATEST_FILE" ]; then
-        [ "$VERBOSE_MODE" -eq 1 ] && logger -s "Latest DPI data file: $LATEST_FILE" -p daemon.info
-    else
-        logger -s "No DPI output file found after UBUS call or parser" -p daemon.warning
-    fi
+	# Log the newest output file
+	LATEST_FILE=$(ls -t "${TMP_DIR}/dpi_summary_by_client"*.json.gz 2>/dev/null | head -n1)
+	if [ -n "$LATEST_FILE" ]; then
+		[ "$VERBOSE_MODE" -eq 1 ] && logger -s "Latest DPI data file: $LATEST_FILE" -p daemon.info
+	else
+		logger -s "No DPI output file found after UBUS call or parser" -p daemon.warning
+	fi
 }
 
-
-
-#this function is used to make copy of /tmp/ns-report/ files and copied into /tmp/openwisp/monitoring/ dir 
-# prepare_tsip_files() {
-#     TSIP_REPORT_DIR="/tmp/ns.report"
-#     attack_file="$TSIP_REPORT_DIR/tsip-attack-report.json"
-#     malware_file="$TSIP_REPORT_DIR/tsip-malware-report.json"
-
-#     included=""
-#     if [ -f "$attack_file" ]; then
-#         included="\"attack\""
-#     fi
-#     if [ -f "$malware_file" ]; then
-#         if [ -n "$included" ]; then
-#             included="$included, \"malware\""
-#         else
-#             included="\"malware\""
-#         fi
-#     fi
-
-#     if [ -n "$included" ]; then
-#         timestamp=$(date +"%Y%m%d_%H%M%S")
-#         merged_file="$TMP_DIR/tsip_combined_${timestamp}.json"
-
-#         {
-#             echo "{"
-#             echo "  \"included_reports\": [$included]"
-
-#             if [ -f "$attack_file" ]; then
-#                 echo ",  \"attack_report\":"
-#                 cat "$attack_file"
-#             fi
-
-#             if [ -f "$malware_file" ]; then
-#                 echo ",  \"malware_report\":"
-#                 cat "$malware_file"
-#             fi
-
-#             echo "}"
-#         } > "$merged_file"
-
-#         [ "$VERBOSE_MODE" -eq 1 ] && logger -s "TSIP reports merged into $merged_file" -p daemon.info
-#     fi
-# }
 
 #this function is used to make copy of /tmp/ns-report/ files and copied into /tmp/openwisp/monitoring/ dir 
 prepare_tsip_files() {
 
-    timestamp=$(date +"%Y%m%d_%H%M%S")
-    filepath="${TMP_DIR}/tsip_combined_${timestamp}.json"
+	timestamp=$(date +"%Y%m%d_%H%M%S")
+	filepath="${TMP_DIR}/tsip_combined_${timestamp}.json"
 
-    # Fetch ubus responses
-    malware_report=$(ubus call ns.report tsip-malware-report 2>/dev/null)
-    attack_report=$(ubus call ns.report tsip-attack-report 2>/dev/null)
+	# Fetch ubus responses
+	malware_report=$(ubus call ns.report tsip-malware-report 2>/dev/null)
+	attack_report=$(ubus call ns.report tsip-attack-report 2>/dev/null)
 
-    # Combine into one JSON object
-    echo "{" > "$filepath"
-    echo " \"BlockList\": $malware_report," >> "$filepath"
-    echo " \"Brute_Force_Attack\": $attack_report" >> "$filepath"
-    echo "}" >> "$filepath"
+	# Combine into one JSON object
+	echo "{" > "$filepath"
+	echo " \"BlockList\": $malware_report," >> "$filepath"
+	echo " \"Brute_Force_Attack\": $attack_report" >> "$filepath"
+	echo "}" >> "$filepath"
 
 	if jq -e 'type == "object" and (keys | length > 0) or type == "array" and length > 0' "$filepath" > /dev/null 2>&1; then
 		gzip -f "$filepath"
@@ -176,31 +132,30 @@ prepare_tsip_files() {
 	else
 		logger -s "Failed to collect TSIP Report data via UBUS" -p daemon.error
 		return 1
-	fi
-
+	fi	
 
 }       
 
 #this function is used to read the real-time traffic tab data in file and send to controller
 collect_real_time_traffic() {
-    [ "$VERBOSE_MODE" -eq 1 ] && logger -s "Running talkers data collection via UBUS" -p daemon.info
+	[ "$VERBOSE_MODE" -eq 1 ] && logger -s "Running talkers data collection via UBUS" -p daemon.info
 
-    TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-    OUTPUT_FILE="${TMP_DIR}/real_time_traffic_data_${TIMESTAMP}.json.gz"
+	TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+	OUTPUT_FILE="${TMP_DIR}/real_time_traffic_data_${TIMESTAMP}.json.gz"
 
-    # Collect data using ubus and compress it
-    if ubus call ns.talkers list 2>/dev/null | gzip > "$OUTPUT_FILE"; then
-        [ "$VERBOSE_MODE" -eq 1 ] && logger -s "real time traffic data collected and saved to $OUTPUT_FILE" -p daemon.info
-    else
-        logger -s "Failed to collect talkers data via UBUS" -p daemon.error
-        return 1
-    fi
+	# Collect data using ubus and compress it
+	if ubus call ns.talkers list 2>/dev/null | gzip > "$OUTPUT_FILE"; then
+		[ "$VERBOSE_MODE" -eq 1 ] && logger -s "real time traffic data collected and saved to $OUTPUT_FILE" -p daemon.info
+	else
+		logger -s "Failed to collect talkers data via UBUS" -p daemon.error
+		return 1
+	fi
 }
 
 #this function is used to take wan-links data from read-monitoring page.
 collect_wan_uplinks_data() {
 	# Generate filename with timestamp
-    	timestamp=$(date +"%Y%m%d_%H%M%S")
+	timestamp=$(date +"%Y%m%d_%H%M%S")
 	
 	#Interfaces List
 	filepath="${TMP_DIR}/interface_lists_${timestamp}.json"
@@ -209,17 +164,38 @@ collect_wan_uplinks_data() {
 	ip=$(ubus call ns.report get-public-ip-addresses 2>/dev/null)
 
 	# Combine into one JSON object
-	echo "{" > "$filepath"
-	echo "  \"qos\": $qos," >> "$filepath"
-	echo "  \"public_ip_report\": $ip" >> "$filepath"
-	echo "}" >> "$filepath"
+	{
+    	echo "{"
+    	echo "  \"wan_status\": ["
 
+		first=1
+		for dev in $(ubus call network.interface dump | jsonfilter -e '@.interface[*].device'); do
+				case "$dev" in
+					eth*)
+						intf=$(ubus call network.interface dump | jsonfilter -e "@.interface[@.device='${dev}'].interface")
+						up=$(ubus call network.interface dump | jsonfilter -e "@.interface[@.device='${dev}'].up")
+
+						[ "$up" = "true" ] && up_bool=true || up_bool=false
+
+						[ $first -eq 0 ] && echo ","
+						first=0
+
+						echo "    {\"interface\": \"$intf\", \"device\": \"$dev\", \"up\": $up_bool}"
+						;;
+				esac
+		done
+
+		echo "  ],"
+		echo "  \"public_ip_report\": $ip,"
+		echo "  \"qos\": $qos"
+		echo "}"
+	} > "$filepath"
 	if jq -e 'type == "object" and (keys | length > 0) or type == "array" and length > 0' "$filepath" > /dev/null 2>&1; then
-	    gzip -f "$filepath"
-	    [ "$VERBOSE_MODE" -eq 1 ] && logger -s "Interface List data saved into $filepath" -p daemon.info
+		gzip -f "$filepath"
+		[ "$VERBOSE_MODE" -eq 1 ] && logger -s "Interface List data saved into $filepath" -p daemon.info
 	else
-	    logger -s "Failed to collect Interface List data via UBUS" -p daemon.error
-	    return 1
+		logger -s "Failed to collect Interface List data via UBUS" -p daemon.error
+		return 1
 	fi
 
 
@@ -228,12 +204,12 @@ collect_wan_uplinks_data() {
 	#Interfaces Events
 	filepath="${TMP_DIR}/interface_events_${timestamp}.json"
 	if ubus call ns.report mwan-report 2>/dev/null | sed 's/^[[:space:]]*//' > "$filepath"; then
-        gzip -f "$filepath"
-        [ "$VERBOSE_MODE" -eq 1 ] && logger -s "Interfaces Events data save into $filepath" -p daemon.info
-    else
-        logger -s "Failed to collect latency and quality reports data via UBUS" -p daemon.error
-        return 1
-    fi
+		gzip -f "$filepath"
+		[ "$VERBOSE_MODE" -eq 1 ] && logger -s "Interfaces Events data save into $filepath" -p daemon.info
+	else
+		logger -s "Failed to collect latency and quality reports data via UBUS" -p daemon.error
+		return 1
+	fi
 	#----------------------------------------------------------------------------------------------------
 
 	#Interface Traffics
@@ -259,11 +235,11 @@ collect_wan_uplinks_data() {
 	echo "}" >> "$filepath"
 
 	if jq -e 'type == "object" and (keys | length > 0) or type == "array" and length > 0' "$filepath" > /dev/null 2>&1; then
-	    gzip -f "$filepath"
-	    [ "$VERBOSE_MODE" -eq 1 ] && logger -s "Interface Traffic data saved into $filepath" -p daemon.info
+		gzip -f "$filepath"
+		[ "$VERBOSE_MODE" -eq 1 ] && logger -s "Interface Traffic data saved into $filepath" -p daemon.info
 	else
-	    logger -s "Failed to collect Interface Traffic data via UBUS" -p daemon.error
-	    return 1
+		logger -s "Failed to collect Interface Traffic data via UBUS" -p daemon.error
+		return 1
 	fi
 
 	#-----------------------------------------------------------------------------------------------------------
@@ -271,15 +247,45 @@ collect_wan_uplinks_data() {
 	# Run this ubus command to get the latency and quality reports from the wan-uplinks tab.
 	filepath="${TMP_DIR}/latency_and_quality_${timestamp}.json"
 	if ubus call ns.report latency-and-quality-report 2>/dev/null | sed 's/^[[:space:]]*//' > "$filepath"; then
-	gzip -f "$filepath"
-	[ "$VERBOSE_MODE" -eq 1 ] && logger -s " Latency and quality report data save into $filepath" -p daemon.info
+		gzip -f "$filepath"
+		[ "$VERBOSE_MODE" -eq 1 ] && logger -s " Latency and quality report data save into $filepath" -p daemon.info
 	else
-    	logger -s "Failed to collect latency and quality reports data via UBUS" -p daemon.error
-    	return 1
+		logger -s "Failed to collect latency and quality reports data via UBUS" -p daemon.error
+		return 1
 	fi
 
 }
 
+#This functions is used to get the current wan interface status 
+wan_interface_health()
+{
+	# Save JSON output to a file
+	filepath="${TMP_DIR}/wan_status_${timestamp}.json"
+
+	{
+		echo "["
+		first=1
+		found=0
+		for dev in $(ubus call network.interface dump | jsonfilter -e '@.interface[*].device'); do
+			case "$dev" in
+				eth*)
+					intf=$(ubus call network.interface dump | jsonfilter -e "@.interface[@.device='${dev}'].interface")
+					up=$(ubus call network.interface dump | jsonfilter -e "@.interface[@.device='${dev}'].up")
+
+					[ "$up" = "true" ] && up_bool=true || up_bool=false
+
+					[ $first -eq 0 ] && echo ","
+					first=0
+					found=1
+
+					echo "  {\"interface\": \"$intf\", \"device\": \"$dev\", \"up\": $up_bool}"
+					;;
+			esac
+		done
+		echo "]"
+	} > "$filepath"
+	gzip -f "$filepath"
+}
 
 
 set_url_and_curl() {
@@ -322,8 +328,10 @@ save_data() {
 		#this function call to collect real time traffic data.
 		collect_real_time_traffic
 		#this function call to collect wan uplinks data
-		collect_wan_uplinks_data		
-				
+		collect_wan_uplinks_data
+		#this function is called to get the current wan interface status
+		wan_interface_health
+			
 		# get process id of the process sending data
 		pid=$(pgrep -f "openwisp-monitoring.*--mode send")
 		kill -SIGUSR1 "$pid"
@@ -367,9 +375,9 @@ send_data() {
 			if [[ "$basefilename" == dpi_summary_by_client_* ]]; then
 				endpoint="monitoring/device/$UUID/dpi_client_summary/"
 			elif [[ "$basefilename" == dpi_summary_v2_* ]]; then
-                    endpoint="monitoring/device/$UUID/dpi_summary_v2/" 
+				endpoint="monitoring/device/$UUID/dpi_summary_v2/" 
 			elif [[ "$basefilename" == tsip_* ]]; then
-    				endpoint="monitoring/device/$UUID/tsipreport/"
+				endpoint="monitoring/device/$UUID/tsipreport/"
 			elif [[ "$basefilename" == real_time_traffic_data_* ]]; then
 				endpoint="monitoring/device/$UUID/real_traffic/"
 			elif [[ "$basefilename" == latency_and_quality_* ]]; then
@@ -380,6 +388,8 @@ send_data() {
 				endpoint="monitoring/device/$UUID/interface_event/"
 			elif [[ "$basefilename" == interface_traffics_* ]]; then
 				endpoint="monitoring/device/$UUID/interface_traffic/"
+			elif [[ "$basefilename" == wan_status_* ]]; then
+				endpoint="monitoring/device/$UUID/wan_status/"
 			else
 				endpoint="monitoring/device/$UUID/"
 			fi
