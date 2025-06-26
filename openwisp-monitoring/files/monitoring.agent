@@ -4,6 +4,11 @@
 
 # Default DPI dump location
 DPI_DUMP_PATH=${DPI_DUMP_PATH:-/var/run/dpireport}
+INTERVAL_DPI=120
+INTERVAL_TSIP=90
+INTERVAL_REALTIME=20
+INTERVAL_WAN=20
+INTERVAL_IPSEC=30
 
 show_help() {
 	printf "Usage:\n"
@@ -66,8 +71,7 @@ check_available_memory() {
 
 collect_data() {
 	n=0
-	[ "$VERBOSE_MODE" -eq "1" ] && logger -s "Collecting NetJSON Monitoring data." \
-		-p daemon.info
+	[ "$VERBOSE_MODE" -eq "1" ] && logger -s "Collecting NetJSON Monitoring data." -p daemon.info
 	until [ "$n" -ge 5 ]; do
 		/usr/sbin/netjson-monitoring --dump "$MONITORED_INTERFACES" && break
 
@@ -81,31 +85,28 @@ collect_data() {
 
 #this function is used to collect dpi data of all clients and compose into single json file.
 collect_dpi() {
-	[ "$VERBOSE_MODE" -eq 1 ] && logger -s "Running DPI data collection via UBUS" -p daemon.info
 
 	# Generate a timestamped filename
 	TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 	OUTPUT_FILE="${TMP_DIR}/dpi_summary_v2_${TIMESTAMP}.json.gz"
 
 	# Collect data using ubus and compress it into the output file
-	[ "$VERBOSE_MODE" -eq 1 ] && logger -s "Call ubus command for summary-v2 data collect...." -p daemon.info
 	if ubus call ns.dpireport summary-v2 2>/dev/null | gzip > "$OUTPUT_FILE"; then
-		[ "$VERBOSE_MODE" -eq 1 ] && logger -s "DPI data collected and saved to $OUTPUT_FILE" -p daemon.info
+		[ "$VERBOSE_MODE" -eq 1 ] && logger -s "Collected summary by V2 data to $OUTPUT_FILE" -p daemon.info
 	else
-		logger -s "Failed to collect DPI data via UBUS" -p daemon.error
+		logger -s "Failed to Collected summary by V2 data via UBUS" -p daemon.error
 		return 1
 	fi
 
 	# Run the parser script
-	[ "$VERBOSE_MODE" -eq 1 ] && logger -s "Running collect_dpi_client_data script........" -p daemon.info
 	/usr/bin/python3 /usr/sbin/collect_dpi_client_data.py
 
 	# Log the newest output file
 	LATEST_FILE=$(ls -t "${TMP_DIR}/dpi_summary_by_client"*.json.gz 2>/dev/null | head -n1)
 	if [ -n "$LATEST_FILE" ]; then
-		[ "$VERBOSE_MODE" -eq 1 ] && logger -s "Latest DPI data file: $LATEST_FILE" -p daemon.info
+		[ "$VERBOSE_MODE" -eq 1 ] && logger -s "Collected summary by client data to file: $LATEST_FILE" -p daemon.info
 	else
-		logger -s "No DPI output file found after UBUS call or parser" -p daemon.warning
+		logger -s "Failed to Collected summary by client data via collect_dpi_client_data.py script" -p daemon.warning
 	fi
 }
 
@@ -134,20 +135,18 @@ prepare_tsip_files() {
 		return 1
 	fi	
 
-}       
+}
 
 #this function is used to read the real-time traffic tab data in file and send to controller
 collect_real_time_traffic() {
-	[ "$VERBOSE_MODE" -eq 1 ] && logger -s "Running talkers data collection via UBUS" -p daemon.info
-
 	TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 	OUTPUT_FILE="${TMP_DIR}/real_time_traffic_data_${TIMESTAMP}.json.gz"
 
 	# Collect data using ubus and compress it
 	if ubus call ns.talkers list 2>/dev/null | gzip > "$OUTPUT_FILE"; then
-		[ "$VERBOSE_MODE" -eq 1 ] && logger -s "real time traffic data collected and saved to $OUTPUT_FILE" -p daemon.info
+		[ "$VERBOSE_MODE" -eq 1 ] && logger -s "Real time traffic data collected and saved to $OUTPUT_FILE" -p daemon.info
 	else
-		logger -s "Failed to collect talkers data via UBUS" -p daemon.error
+		logger -s "Failed to collect Real time traffic data via UBUS" -p daemon.error
 		return 1
 	fi
 }
@@ -165,8 +164,8 @@ collect_wan_uplinks_data() {
 
 	# Combine into one JSON object
 	{
-    	echo "{"
-    	echo "  \"wan_status\": ["
+		echo "{"
+		echo "  \"wan_status\": ["
 
 		first=1
 		for dev in $(ubus call network.interface dump | jsonfilter -e '@.interface[*].device'); do
@@ -284,7 +283,25 @@ wan_interface_health()
 		done
 		echo "]"
 	} > "$filepath"
+	
+	[ "$VERBOSE_MODE" -eq 1 ] && logger -s "wan health status data saved..." -p daemon.info
 	gzip -f "$filepath"
+}
+
+#this function get the details of ipsec tunnels list.
+ipsec_tunnel_list() {
+	[ "$VERBOSE_MODE" -eq 1 ] && logger -s "Taking ipsec tunnel status.." -p daemon.info
+
+	TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+	OUTPUT_FILE="${TMP_DIR}/ipsectunnel_list_${TIMESTAMP}.json.gz"
+
+	# Collect data using ubus and compress it
+	if ubus call ns.ipsectunnel list-tunnels  2>/dev/null | gzip > "$OUTPUT_FILE"; then
+		[ "$VERBOSE_MODE" -eq 1 ] && logger -s "ipsec tunnel data appended into $OUTPUT_FILE" -p daemon.info
+	else
+		logger -s "Failed to collect ipsec tunnel list data.." -p daemon.error
+		return 1
+	fi
 }
 
 
@@ -309,35 +326,17 @@ set_url_and_curl() {
 }
 
 save_data() {
-	while true; do
-		if check_available_memory; then
-			data="$(collect_data)"
-			filename="$(date -u +'%d-%m-%Y_%H:%M:%S')"
-			# save data with file_name
-			echo "$data" >"$TMP_DIR/$filename"
-			# compress data
-			gzip "$TMP_DIR/$filename"
-			[ "$VERBOSE_MODE" -eq "1" ] && logger -s "Data saved temporarily." \
-				-p daemon.info
-		fi
-		
-		# Stage DPI JSON
-		collect_dpi
-		#this function call to copy security reports file from real-monitoring.
-		prepare_tsip_files
-		#this function call to collect real time traffic data.
-		collect_real_time_traffic
-		#this function call to collect wan uplinks data
-		collect_wan_uplinks_data
-		#this function is called to get the current wan interface status
-		wan_interface_health
-			
-		# get process id of the process sending data
-		pid=$(pgrep -f "openwisp-monitoring.*--mode send")
-		kill -SIGUSR1 "$pid"
-		sleep "$INTERVAL"
-	done
+	if check_available_memory; then
+		data="$(collect_data)"
+		filename="$(date -u +'%d-%m-%Y_%H:%M:%S')"
+		# save data with file_name
+		echo "$data" >"$TMP_DIR/$filename"
+		# compress data
+		gzip "$TMP_DIR/$filename"
+		[ "$VERBOSE_MODE" -eq "1" ] && logger -s "Data saved temporarily." -p daemon.info
+	fi
 }
+
 
 handle_sigusr1() {
 	[ "$VERBOSE_MODE" -eq "1" ] && logger -s "SIGUSR1 received! Sending data." \
@@ -346,18 +345,29 @@ handle_sigusr1() {
 }
 
 send_data() {
-    success=0
+	success=0
+	one_time_enter=0
+	
+	# handled here if device reboot within interval of hour to read old value from file and continue to append.
+	if [ -f "/etc/data_sent.log" ]; then
+		total_bytes=$(tail -n 2 /etc/data_sent.log | head -n 1 | awk '{print int($8 * 1024)}')
+	else
+		total_bytes=0
+	fi
 
 	while true; do
+
 		for file in "$TMP_DIR"/*; do
 			# Skip non-regular files
-			if [ ! -f "$file" ]; then
-				[ "$VERBOSE_MODE" -eq 1 ] && logger -s "No data file found to send." -p daemon.info
-				trap handle_sigusr1 USR1
-				sleep "$INTERVAL" &
-				wait $!
-				continue
-			fi
+			# if [ ! -f "$file" ]; then
+			# 	[ "$VERBOSE_MODE" -eq 1 ] && logger -s "No data file found to send." -p daemon.info
+			# 	trap handle_sigusr1 USR1
+			# 	sleep "$INTERVAL" &
+			# 	wait $!
+			# 	continue
+			# fi
+
+			[ ! -f "$file" ] && continue
 
 			# Temporarily disable SIGUSR1 handling during processing
 			trap "" USR1
@@ -371,33 +381,44 @@ send_data() {
 				continue
 			fi
 
-			# Determine endpoint based on filename prefix
-			if [[ "$basefilename" == dpi_summary_by_client_* ]]; then
-				endpoint="monitoring/device/$UUID/dpi_client_summary/"
-			elif [[ "$basefilename" == dpi_summary_v2_* ]]; then
-				endpoint="monitoring/device/$UUID/dpi_summary_v2/" 
-			elif [[ "$basefilename" == tsip_* ]]; then
-				endpoint="monitoring/device/$UUID/tsipreport/"
-			elif [[ "$basefilename" == real_time_traffic_data_* ]]; then
-				endpoint="monitoring/device/$UUID/real_traffic/"
-			elif [[ "$basefilename" == latency_and_quality_* ]]; then
-				endpoint="monitoring/device/$UUID/lat_qua_report/"
-			elif [[ "$basefilename" == interface_lists_* ]]; then
-				endpoint="monitoring/device/$UUID/interface_list/"
-			elif [[ "$basefilename" == interface_events_* ]]; then
-				endpoint="monitoring/device/$UUID/interface_event/"
-			elif [[ "$basefilename" == interface_traffics_* ]]; then
-				endpoint="monitoring/device/$UUID/interface_traffic/"
-			elif [[ "$basefilename" == wan_status_* ]]; then
-				endpoint="monitoring/device/$UUID/wan_status/"
-			else
-				endpoint="monitoring/device/$UUID/"
-			fi
+			case "$basefilename" in
+				dpi_summary_by_client_*) 
+					endpoint="monitoring/device/$UUID/dpi_client_summary/" 
+					;;
+				dpi_summary_v2_*)
+					endpoint="monitoring/device/$UUID/dpi_summary_v2/"
+					;;
+				tsip_*) 
+					endpoint="monitoring/device/$UUID/tsipreport/" 
+					;;
+				real_time_traffic_data_*) 
+					endpoint="monitoring/device/$UUID/real_traffic/" 
+					;;
+				latency_and_quality_*)
+					endpoint="monitoring/device/$UUID/lat_qua_report/"
+					;;
+				interface_lists_*)
+					endpoint="monitoring/device/$UUID/interface_list/"
+					;;
+				interface_events_*)
+					endpoint="monitoring/device/$UUID/interface_event/"
+					;;
+				interface_traffics_*)
+					endpoint="monitoring/device/$UUID/interface_traffic/"
+					;;
+				wan_status_*) 
+					endpoint="monitoring/device/$UUID/wan_status/" 
+					;;
+				ipsectunnel_list_*)
+					endpoint="monitoring/device/$UUID/ipsectunnel_list/"
+					;;
+				*) 
+					endpoint="monitoring/device/$UUID/" 
+					;;
+			esac
 
 			url="$BASE_URL/api/v1/$endpoint?key=$KEY&time=${filename}.000000"
-			[ "$VERBOSE_MODE" -eq 1 ] && logger -s "Data sent successfully: $url" -p daemon.info 
 
-			
 			# Decompress if gzipped
 			if [[ "${basefilename##*.}" = "gz" ]]; then
 				gzip -d "$file"
@@ -420,13 +441,10 @@ send_data() {
 						FAILING=0
 					fi
 
+					size=$(ls -l "$file" 2>/dev/null | awk '{print $5}')
+					total_bytes=$((total_bytes + size)) 
+
 					rm -f "$RESPONSE_FILE" "$file"
-					
-					# if this was a decompressed .json, also delete its .json.gz counterpart
-					#gzfile="$TMP_DIR/${basefilename}"
-					#jsonfile="${gzfile%.gz}"
-					#rm -f "$RESPONSE_FILE" "$jsonfile" "$gzfile"
-					
 					break
 
 				elif [ "$response_code" = "400" ]; then
@@ -448,11 +466,23 @@ send_data() {
 				sleep $((failures * 2))
 			done
 		done
-
-		# Wait before the next cycle or until signal is received
-		trap handle_sigusr1 USR1
-		sleep "$INTERVAL" &
-		wait $!
+		
+		last_min=`date -d "1 min ago" "+%M"`	#this will get the last min value (0 .... 59)
+		last_sec=`date -d "1 min ago" "+%S"`    #this will find sec value (0 ... 59)
+		if [ "$total_bytes" -ge 0 ] && [ "$last_min" -eq 58 ] && [ "$last_sec" -eq 59 ]; then
+			if [ "$one_time_enter" -eq 0 ]; then
+				timestamp=$(date +"%Y-%m-%d %H:%M:%S")
+				total_kb=$(awk -v bytes="$total_bytes" 'BEGIN { printf "%.2f", bytes/1024 }')
+				echo "$timestamp -- Total byte sent - $total_kb Kb " >> /etc/data_sent.log
+				echo "----------------------------------------------------end" >> /etc/data_sent.log
+				one_time_enter=1				# 1 flag value to avoid multiple write value in file.
+				total_bytes=0					# set 0, to accumulate hourly data bytes value.
+			fi
+		fi
+		last_sec=`date -d "1 min ago" "+%S"`    # this will find sec value (0 ... 59)
+		if [ "$last_sec" -eq 10 ]; then
+			one_time_enter=0					# 0 flag after 10 sec
+		fi
 	done
 }
 
@@ -461,17 +491,15 @@ wait_until_registered() {
 	if [ -n "$UUID" ] && [ -n "$KEY" ]; then
 		return 0
 	fi
-	logger -s "Waiting for device to register." \
-		-t openwisp-monitoring \
-		-p daemon.info
+	logger -s "Waiting for device to register." -t openwisp-monitoring -p daemon.info
+
 	UUID=$(uci get openwisp.http.uuid 2>/dev/null)
 	KEY=$(uci get openwisp.http.key 2>/dev/null)
 	if [ -z "$UUID" ] || [ -z "$KEY" ]; then
 		return 1
 	fi
-	logger -s "Setting uuid and key." \
-		-t openwisp-monitoring \
-		-p daemon.info
+	logger -s "Setting uuid and key." -t openwisp-monitoring -p daemon.info
+
 	export UUID KEY
 }
 
@@ -481,15 +509,60 @@ bootup_delay() {
 		if [ "$BOOTUP_DELAY" -ne "0" ]; then
 			# get a random number between zero and $BOOTUP_DELAY
 			DELAY=$(/usr/sbin/openwisp-get-random-number 0 "$BOOTUP_DELAY")
-			logger "Delaying initialization of the monitoring agent for $DELAY seconds." \
-				-t openwisp-monitoring \
-				-p daemon.info
+			logger "Delaying initialization of the monitoring agent for $DELAY seconds." -t openwisp-monitoring -p daemon.info
 			sleep "$DELAY"
 		fi
 		# send bootup hotplug event
 		touch "$BOOTUP"
 	fi
 }
+
+#call this supervisor loop function for gather all data.
+collect_supervisor_loop() {
+	local last_save=0
+	local last_dpi=0
+	local last_tsip=0
+	local last_realtime=0
+	local last_ipsec_stat=0
+
+	while true; do
+		now=$(date +%s)
+
+		if [ $((now - last_save)) -ge "$INTERVAL" ]; then
+			save_data			#default interval 300sec
+			last_save=$now
+		fi
+
+		if [ $((now - last_dpi)) -ge "$INTERVAL_DPI" ]; then
+			collect_dpi 		#default interval 120sec
+			last_dpi=$now
+		fi
+
+		if [ $((now - last_tsip)) -ge "$INTERVAL_TSIP" ]; then
+			prepare_tsip_files		#default interval 90sec
+			last_tsip=$now
+		fi
+
+		if [ $((now - last_realtime)) -ge "$INTERVAL_REALTIME" ]; then
+			collect_real_time_traffic			#default interval 60sec
+			last_realtime=$now
+		fi
+
+		if [ $((now - last_wan)) -ge "$INTERVAL_WAN" ]; then
+			collect_wan_uplinks_data		#default interval 30sec
+			wan_interface_health			#default interval 30sec
+			last_wan=$now
+		fi
+
+		if [ $((now - last_ipsec_stat)) -ge "$INTERVAL_IPSEC" ]; then
+			ipsec_tunnel_list			#default interval 30sec
+			last_ipsec_stat=$now
+		fi
+		
+		sleep 1  # prevent 100% CPU
+	done
+}
+
 
 main() {
 	# parse options
@@ -586,7 +659,10 @@ main() {
 		MONITORED_INTERFACES=${MONITORED_INTERFACES:-*}
 		# remove double quotes from interfaces
 		MONITORED_INTERFACES=$(echo "$MONITORED_INTERFACES" | tr -d '"')
-		save_data
+		
+		#save_data
+		# call this function to run all function with thier respective interval
+		collect_supervisor_loop
 	elif [ "$MODE" = "send" ]; then
 		until wait_until_registered; do
 			sleep "$REGISTRATION_INTERVAL"
@@ -600,3 +676,4 @@ main() {
 }
 
 main "$@"
+
