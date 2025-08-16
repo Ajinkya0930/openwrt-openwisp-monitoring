@@ -4,6 +4,8 @@
 -- and return it as NetJSON Output
 package.path = package.path .. ";../files/lib/?.lua"
 
+local nixio = require("nixio")
+local uci = require("uci").cursor()
 local cjson = require('cjson')
 local io = require('io')
 
@@ -25,13 +27,19 @@ local load_average = {
   tonumber(loadavg_output[3])
 }
 
+local sernum_file = io.popen('cat /sys/class/dmi/id/board_serial')
+local serial_number = sernum_file:read()
+sernum_file:close()
+
+
 -- init netjson data structure
 local netjson = {
   type = 'DeviceMonitoring',
   general = {
     hostname = board.hostname,
     local_time = system_info.localtime,
-    uptime = system_info.uptime
+    uptime = system_info.uptime,
+    serialnumber = serial_number
   },
   resources = {
     load = load_average,
@@ -70,69 +78,46 @@ local host_interfaces = {}
 local dns_servers = {}
 local dns_search = {}
 
-local function get_wireless_netjson_interface(radio, name, iwinfo)
-  local clients = nil
-  local is_mesh = false
-  local htmode = radio.config.htmode
-  local netjson_interface = {
-    name = name,
-    type = 'wireless',
-  }
-  -- iwinfo disabled
-  if iwinfo == nil then
-    return netjson_interface
-  end
-  -- if channel is missing the WiFi interface is not fully up
-  -- and hence we avoid including its info because it will be rejected
-  if monitoring.utils.is_empty(iwinfo.channel) == false then
-    netjson_interface.wireless = {
-      ssid = iwinfo.ssid,
-      mode = monitoring.wifi.iwinfo_modes[iwinfo.mode] or iwinfo.mode,
-      channel = iwinfo.channel,
-      frequency = iwinfo.frequency,
-      tx_power = iwinfo.txpower,
-      signal = iwinfo.signal,
-      noise = iwinfo.noise,
-      country = iwinfo.country,
-      quality = iwinfo.quality,
-      quality_max = iwinfo.quality_max,
-      bitrate = iwinfo.bitrate,
-      htmode = htmode
-    }
-    if iwinfo.mode == 'Ad-Hoc' or iwinfo.mode == 'Mesh Point' or iwinfo.mode ==
-      'Client' then
-      clients = ubus:call('iwinfo', 'assoclist', {device = name}).results
-      is_mesh = true
-    else
-      local hostapd_output = ubus:call('hostapd.' .. name, 'get_clients', {})
-      if hostapd_output then clients = hostapd_output.clients end
-    end
-    if not monitoring.utils.is_table_empty(clients) then
-      netjson_interface.wireless.clients = monitoring.wifi.netjson_clients(clients,
-        is_mesh)
-    end
-  end
-  return netjson_interface
-end
-
 -- collect relevant wireless interface stats
--- (traffic and connected clients)
 for _, radio in pairs(wireless_status) do
   for _, interface in ipairs(radio.interfaces) do
     local name = interface.ifname
+    local is_mesh = false
+    local clients = nil
     if name and not monitoring.utils.is_excluded(name) then
-      local iwinfo = nil
-      if monitoring.iwinfo.enabled then
-        iwinfo = ubus:call('iwinfo', 'info', {device = name})
+      local iwinfo = ubus:call('iwinfo', 'info', {device = name})
+      local netjson_interface = {
+        name = name,
+        type = 'wireless',
+        wireless = {
+          ssid = iwinfo.ssid,
+          mode = monitoring.wifi.iwinfo_modes[iwinfo.mode] or iwinfo.mode,
+          channel = iwinfo.channel,
+          frequency = iwinfo.frequency,
+          tx_power = iwinfo.txpower,
+          signal = iwinfo.signal,
+          noise = iwinfo.noise,
+          country = iwinfo.country
+        }
+      }
+      if iwinfo.mode == 'Ad-Hoc' or iwinfo.mode == 'Mesh Point' then
+        clients = ubus:call('iwinfo', 'assoclist', {device = name}).results
+        is_mesh = true
+      else
+        local hostapd_output = ubus:call('hostapd.' .. name, 'get_clients', {})
+        if hostapd_output then clients = hostapd_output.clients end
       end
-      wireless_interfaces[name] = get_wireless_netjson_interface(radio, name, iwinfo)
+      if not monitoring.utils.is_table_empty(clients) then
+        netjson_interface.wireless.clients =
+          monitoring.wifi.netjson_clients(clients, is_mesh)
+      end
+      wireless_interfaces[name] = netjson_interface
     end
   end
 end
 
 -- collect interface stats
 for name, interface in pairs(network_status) do
-  -- only collect data from iterfaces which have not been excluded
   if not monitoring.utils.is_excluded(name) then
     local netjson_interface = {
       name = name,
@@ -142,10 +127,10 @@ for name, interface in pairs(network_status) do
       txqueuelen = interface.txqueuelen,
       mtu = interface.mtu,
       speed = interface.speed,
+      bridge_members = interface['bridge-members'],
       multicast = interface.multicast
     }
 
-    -- add existing bridge members only
     if interface['bridge-members'] ~= nil then
       local bridge_members = {}
       for _, bridge_member in ipairs(interface['bridge-members']) do
@@ -156,9 +141,7 @@ for name, interface in pairs(network_status) do
           end
         end
       end
-      if next(bridge_members) ~= nil then
-        netjson_interface['bridge_members'] = bridge_members
-      end
+      netjson_interface['bridge_members'] = bridge_members
     end
     if wireless_interfaces[name] then
       monitoring.utils.dict_merge(wireless_interfaces[name], netjson_interface)
@@ -177,20 +160,11 @@ for name, interface in pairs(network_status) do
     end
     if include_stats[name] or traffic_monitored == '*' then
       if monitoring.wifi.needs_inversion(netjson_interface) then
-        --- ensure wifi access point interfaces
-        --- show download and upload values from
-        --- the user's perspective and not from the router perspective
         interface.statistics = monitoring.wifi.invert_rx_tx(interface.statistics)
       end
       netjson_interface.statistics = interface.statistics
     end
     local addresses = monitoring.interfaces.get_addresses(name)
-    local virtual_interfaces = {'wireguard'}
-
-    if next(addresses) and
-      monitoring.utils.has_value(virtual_interfaces, addresses[1].proto) then
-      netjson_interface.type = 'virtual'
-    end
     if next(addresses) then netjson_interface.addresses = addresses end
     local info = monitoring.interfaces.get_interface_info(name, netjson_interface)
     if info.stp ~= nil then netjson_interface.stp = info.stp end
@@ -198,7 +172,6 @@ for name, interface in pairs(network_status) do
       for key, value in pairs(info.specialized) do netjson_interface[key] = value end
     end
     table.insert(host_interfaces, netjson_interface)
-    -- DNS info is independent from interface
     if info.dns_servers then
       monitoring.utils.array_concat(info.dns_servers, dns_servers)
     end
@@ -212,5 +185,165 @@ if next(host_interfaces) ~= nil then netjson.interfaces = host_interfaces end
 if next(dns_servers) ~= nil then netjson.dns_servers = dns_servers end
 if next(dns_search) ~= nil then netjson.dns_search = dns_search end
 
+
+-- This function is common to all when we read the data from the /etc/config file..................................                                               
+local function read_config(config_name)
+    local result = {}
+
+    -- Check if config file exists
+    if not nixio.fs.access("/etc/config/" .. config_name) then
+        return result  -- return empty table if missing
+    end
+
+    -- Function to rename keys starting with "."
+    local function remove_dot_prefix(tbl)
+        local cleaned = {}
+        for k, v in pairs(tbl) do
+            if string.sub(k, 1, 1) == "." then
+                cleaned[string.sub(k, 2)] = v  -- remove first character "."
+            else
+                cleaned[k] = v
+            end
+        end
+        return cleaned
+    end
+
+    -- Read all sections and clean key names
+    uci:foreach(config_name, nil, function(s)
+        result[#result+1] = remove_dot_prefix(s)
+    end)
+
+    return result
+end
+
+-- This function for /etc/frr/ read config from this files.......................................................
+local function read_frr_config(filename)
+    local result = {}
+    local full_path = "/etc/frr/" .. filename
+    if not nixio.fs.access(full_path) then
+        return result
+    end
+    local file = io.open(full_path, "r")
+    if file then
+        result.content = file:read("*all")
+        file:close()
+    end
+    return result
+end
+ 
+-- Collect data of System ......taking data of snmp,tr069,icmp check, schedule
+netjson.system = {
+	snmp      = read_config("snmp"),
+	tr069     = read_config("tr069"),
+	icmpcheck = read_config("icmpcheck"),
+	schedule  = read_config("schedule")
+}
+
+-- Add firewall information
+netjson.firewall = {
+    port_forward = {
+	ubus:call('ns.redirects', 'list-redirects', {}) or {}
+    },
+    nat = {
+	rules = ubus:call('ns.nat', 'list-rules', {}) or {},
+	netmap = ubus:call('ns.netmap', 'list-rules', {}) or {},
+	nat_helper = ubus:call('ns.nathelpers', 'list-nat-helpers', {}) or {}
+    },
+    rules = {
+ 	zones = ubus:call('ns.firewall', 'list_zones', {}) or {},
+ 	forwardings = ubus:call('ns.firewall', 'list_forwardings', {}) or {},
+ 	input_rules = ubus:call('ns.firewall', 'list-input-rules', {}) or {},
+	output_rules = ubus:call('ns.firewall', 'list-output-rules', {}) or {},
+	forward_rules = ubus:call('ns.firewall', 'list-forward-rules', {}) or {},
+	redirects = ubus:call('ns.firewall', 'list_redirects', {}) or {}
+    },
+    connections = {
+	ubus:call('ns.conntrack', 'list', {}) or {}
+    }
+}
+
+
+-- Collect data of Network --> DNS and DHCP tab.
+netjson.network = {
+    DNS_DHCP = {
+	DHCP_MAC = ubus:call('ns.dhcp', 'list-interfaces', {}) or {} ,
+	Static_Lease = ubus:call('ns.dhcp', 'list-static-leases', {}) or {} ,
+	Dynamic_Lease = ubus:call('ns.dhcp', 'list-active-leases', {}) or {} ,
+	DNS = ubus:call('ns.dns', 'get-config', {}) or {} ,
+	DNS_Records = ubus:call('ns.dns', 'list-records', {}) or {} ,
+ 	Scan_Network = ubus:call('ns.scan', 'list-interfaces', {}) or {} 
+    },
+    Routes = {
+	IPV4_Routes = ubus:call('ns.routes', 'list-routes', {protocol = 'ipv4'}) or {},
+	IPV4_Maintable = ubus:call('ns.routes', 'main-table', {protocol = 'ipv4'}) or {},
+	IPV6_Routes = ubus:call('ns.routes', 'list-routes', {protocol = 'ipv6'}) or {},
+	IPV6_Maintable = ubus:call('ns.routes', 'main-table', {protocol = 'ipv6'}) or {}
+    },
+    VxLan = read_config("vxlan"), 
+    FlowEdge_Multiwan = {
+	Multiwan_Manager = { Manager_Policy = ubus:call('ns.mwan', 'index_policies', {}) or {},
+	Manager_Rules = ubus:call('ns.mwan', 'index_rules', {}) or {} },
+	General_Settings = { ubus:call('ns.mwan', 'get_default_config', {}) or {}}
+    },
+    LoadBalance = read_config("loadbalance"),
+    Reverse_Proxy = { ubus:call('ns.reverseproxy', 'list-proxies', {}) or {} },
+    QoS = { ubus:call('ns.qos', 'list', {}) or {} },
+    Advanced_QoS = read_config("advance_qos"),
+    RIP = read_frr_config("ripd.conf"),
+    OSPF = read_frr_config("ospfd.conf"),
+    BGP = read_frr_config("bgpd.conf"),
+    VRF = read_config("vrf")
+    
+}
+
+-- Collect data of VPN tab 
+netjson.vpn = {
+	OpenVPN_Tunnel = { ubus:call('ns.ovpntunnel', 'list-tunnels', {}) or {} },
+	IPSec_Tunnel = { server_tunnel = read_config("ipsec"),
+	Static_Lease = ubus:call('ns.ipsectunnel', 'list-tunnels', {}) or {} },
+	L2TP = { server = read_config("l2tp_server") }, 
+	VRRP = read_config("vrrp"),
+	ZeroTier = read_config("zerotier"),
+	Wireguard = { server = read_config("wireguard") },
+	OpenVPN = {
+		Instance = ubus:call('ns.ovpnrw', 'list-instances', {}) or {},
+		Configuration = ubus:call('ns.ovpnrw', 'get-configuration', { instance = "ns_roadwarrior1" }) or {}
+    }
+}
+
+-- Collect Security data from tab
+netjson.security = {
+     InstaShield_Field = {
+	blocklist_feeds = ubus:call('ns.threatshield', 'list-blocklist', {}) or {},
+	local_allowlist = ubus:call('ns.threatshield', 'list-allowed', {}) or {},
+	local_blocklist = ubus:call('ns.threatshield', 'list-blocked', {}) or {},
+	settings = ubus:call('ns.threatshield', 'list-settings', {}) or {}
+     },
+     Instashield_DNS = {
+	blocklist_sources = ubus:call('ns.threatshield', 'dns-list-blocklist', {}) or {},
+	Filter_bypass = ubus:call('ns.threatshield', 'dns-list-bypass', {}) or {},
+	local_blocklist = ubus:call('ns.threatshield', 'dns-list-blocked', {}) or {},
+	settings = ubus:call('ns.threatshield', 'dns-list-settings', {}) or {}
+     },
+     DPI = {
+	rules = ubus:call('ns.dpi', 'list-rules', {}) or {},
+	exceptions = ubus:call('ns.dpi', 'list-exemptions', {}) or {}
+     },
+     IPS = {
+	today_event_list = ubus:call('ns.snort', 'list-events', {}) or {},
+        filter_bypass = ubus:call('ns.snort', 'list-bypasses', {}) or {},
+        disabled_rules = ubus:call('ns.snort', 'list-disabled-rules', {}) or {},
+        suppressed_alerts = ubus:call('ns.snort', 'list-suppressed-alerts', {}) or {},
+        settings = ubus:call('ns.snort', 'settings', {}) or {}
+     },
+     Antivirus = read_config("clamv"),
+     Antispam = read_config("rspamd")
+
+}
+
+
 io.write(cjson.encode(netjson))
 return cjson.encode(netjson)
+
+
+
