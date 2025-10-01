@@ -122,9 +122,20 @@ define Package/openwisp-monitoring/install
 		$(1)/etc/config/openwisp-monitoring
 
 	$(INSTALL_BIN) \
-		files/collect_dpi_client_data.py \
+		files/sbin/collect_dpi_client_data.py \
 		$(1)/usr/sbin/collect_dpi_client_data.py
 
+	$(INSTALL_BIN) \
+		files/sbin/real_time_monitor.sh \
+		$(1)/usr/sbin/real_time_monitor.sh
+	
+	$(INSTALL_BIN) \
+		files/sbin/wan_monitor.sh \
+		$(1)/usr/sbin/wan_monitor.sh
+	
+	$(INSTALL_BIN) \
+		files/sbin/ipsec_monitor.sh \
+		$(1)/usr/sbin/ipsec_monitor.sh
 endef
 
 $(eval $(call BuildPackage,openwisp-monitoring))
