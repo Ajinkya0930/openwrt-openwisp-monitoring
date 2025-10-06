@@ -341,6 +341,148 @@ netjson.security = {
 
 }
 
+-- Collect Real Time Monitor Data.
+-- this will get the dpi agent data from the another script -------------------
+local dpi_summary_client = "/tmp/monitoring_agent/realtime_monitor/dpi_summary_by_client.json"
+local python_status = os.execute("/usr/bin/python3 /usr/sbin/collect_dpi_client_data.py >/dev/null 2>&1")
+local dpiclient_data = {}
+if python_status == 0 then
+  -- Python script ran successfully
+  local file = io.open(dpi_summary_client, "r")
+  if file then
+    local content = file:read("*a")
+    file:close()
+    os.remove(dpi_summary_client)
+
+    -- decode JSON safely
+    local ok, decoded = pcall(cjson.decode, content)
+    if ok then
+      dpiclient_data = decoded
+    else
+      dpiclient_data = {}
+    end
+  else
+    -- file not found
+    dpiclient_data = {}
+  end
+else
+  -- python failed
+  dpiclient_data = {}
+end
+--------------------------------------------------------------------
+-- Read wan uplink data
+-- Function to sanitize tables: ensures all keys are strings
+local function sanitize_table(t)
+    if type(t) ~= "table" then return t end
+    local res = {}
+    for k, v in pairs(t) do
+        local key = tostring(k)
+        if type(v) == "table" then
+            res[key] = sanitize_table(v)
+        else
+            res[key] = v
+        end
+    end
+    return res
+end
+
+-- Run your UBUS command and capture output
+local handle = io.popen("ubus call ns.report mwan-report 2>/dev/null | sed 's/^[[:space:]]*//'")
+local output = handle:read("*a")
+handle:close()
+
+-- Fallback to empty JSON if output is empty
+if not output or output == "" then
+    output = "{}"
+end
+
+-- Decode JSON safely
+local wanevents = {}
+local ok, decoded = pcall(cjson.decode, output)
+if ok and type(decoded) == "table" then
+    wanevents = sanitize_table(decoded)
+else
+    wanevents = {}
+end
+
+------------------------------------------------------
+-- Table to hold WAN traffic
+local wantraffic = {}
+
+-- Get list of WAN devices
+local h = io.popen("ubus call ns.dashboard list-wans")
+local devices_output = h:read("*a")
+h:close()
+
+if devices_output and devices_output ~= "" then
+    local ok, devices_decoded = pcall(cjson.decode, devices_output)
+    if ok and devices_decoded.result then
+        for _, dev_table in ipairs(devices_decoded.result) do
+            local dev_name = dev_table.device  -- <<< extract the string here!
+            if dev_name then
+                -- Get interface traffic for this device
+                local h2 = io.popen('ubus call ns.dashboard interface-traffic "{\\"interface\\":\\"' .. dev_name .. '\\"}"')
+                local stats_output = h2:read("*a")
+                h2:close()
+
+                local stats_table = {}
+                if stats_output and stats_output ~= "" then
+                    local ok2, stats_decoded = pcall(cjson.decode, stats_output)
+                    if ok2 and type(stats_decoded) == "table" then
+                        stats_table = sanitize_table(stats_decoded)
+                    end
+                end
+
+                wantraffic[dev_name] = stats_table
+            end
+        end
+    end
+end
+
+---------------------------------------------------
+-- Step 1: Run UBUS command to read the wan lat and qua data
+local handle = io.popen("ubus call ns.report latency-and-quality-report 2>/dev/null")
+local output = handle:read("*a")
+handle:close()
+
+-- Step 2: Fix malformed output like "{{ ... }}" (remove extra braces)
+if output:match("^%s*{[%s]*{") then
+    output = output:gsub("^%s*{[%s]*{", "{"):gsub("}[%s]*}$", "}")
+end
+
+-- Step 3: If empty or just '{}', fallback to empty table
+if not output or output:match("^%s*$") or output:match("^%s*{}%s*$") then
+    output = "{}"
+end
+
+-- Step 4: Decode JSON safely
+local wan_latquality = {}
+local ok, decoded = pcall(cjson.decode, output)
+if ok and type(decoded) == "table" then
+    wan_latquality = sanitize_table(decoded)
+else
+    wan_latquality = {}
+end
+
+netjson.realtimemonitor = {
+	traffic = {
+		dpi_summery_v2=ubus:call('ns.dpireport' ,'summary-v2' , {}) or {},
+		dpi_client_data= dpiclient_data
+	},
+	security = {
+		blocklist=ubus:call('ns.report' ,'tsip-malware-report' , {}) or {},
+		brute_force_attack=ubus:call('ns.report' ,'tsip-attack-report', {}) or {}
+	},
+	real_time_traffic = {
+		data=ubus:call('ns.talkers' , 'list' , {}) or {}
+	},
+	wan_uplink = {
+		wan_events = wanevents,
+		wan_traffic = wantraffic,
+		wan_lat_qua = wan_latquality
+	}
+	
+}
 
 io.write(cjson.encode(netjson))
 return cjson.encode(netjson)

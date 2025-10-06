@@ -126,10 +126,6 @@ define Package/openwisp-monitoring/install
 		$(1)/usr/sbin/collect_dpi_client_data.py
 
 	$(INSTALL_BIN) \
-		files/sbin/real_time_monitor.sh \
-		$(1)/usr/sbin/real_time_monitor.sh
-	
-	$(INSTALL_BIN) \
 		files/sbin/wan_monitor.sh \
 		$(1)/usr/sbin/wan_monitor.sh
 	
