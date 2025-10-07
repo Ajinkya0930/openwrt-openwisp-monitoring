@@ -5,7 +5,6 @@
 # Default DPI dump location
 DPI_DUMP_PATH=${DPI_DUMP_PATH:-/var/run/dpireport}
 CACHE_DIR="/tmp/cache_dir"
-INTERVAL_REALTIME_MONITOR=300
 INTERVAL_WAN_STATUS=10
 INTERVAL_IPSEC=10
 
@@ -249,11 +248,6 @@ collect_supervisor_loop() {
 		if [ $((now - last_save)) -ge "$INTERVAL" ]; then
 			save_data
 			last_save=$now
-		fi
-
-		if [ $((now - real_time_monitor)) -ge "$INTERVAL_REALTIME_MONITOR" ]; then
-			/usr/sbin/real_time_monitor.sh
-			real_time_monitor=$now
 		fi
 
 		if [ $((now - last_wan_status)) -ge "$INTERVAL_WAN_STATUS" ]; then

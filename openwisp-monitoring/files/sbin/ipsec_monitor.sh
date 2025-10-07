@@ -113,7 +113,5 @@ if [ ! -f "$STATUS_FILE" ] || [ "$new_json" != "$(cat "$STATUS_FILE")" ]; then
     if [ "$success" -ne 1 ]; then
         [ "$VERBOSE_MODE" = "1" ] && logger -t "$LOG_TAG" "All retries failed, data saved in $STATUS_FILE for later troubleshooting."
     fi
-else
-    [ "$VERBOSE_MODE" = "1" ] && logger -t "$LOG_TAG" "No change in ipsec tunnel status; not sending any data."
 fi
 
