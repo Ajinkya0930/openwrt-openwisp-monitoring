@@ -2,12 +2,6 @@
 #
 # OpenWISP Monitoring Daemon
 
-# Default DPI dump location
-DPI_DUMP_PATH=${DPI_DUMP_PATH:-/var/run/dpireport}
-CACHE_DIR="/tmp/cache_dir"
-INTERVAL_WAN_STATUS=10
-INTERVAL_IPSEC=10
-
 show_help() {
 	printf "Usage:\n"
 	printf "  openwisp-monitoring [OPTIONS...]\n"
@@ -27,10 +21,10 @@ show_help() {
 	printf "  --capath <directory>\t\t\t: Value passed to curl --capath argument.\n"
 	printf "OpenWISP Monitoring Config options:\n"
 	printf "  --interval <time>\t\t\t: Time in seconds after which data should be sent/collected.\n"
-	printf "  --monitored-interfaces <interfaces>\t: Interfaces that needs to be monitored.\n"
-	printf "  --verbose-mode <0, 1>\t\t\t: Run agent in verbose mode.\n"
-	printf "  --required-memory <0-1>\t\t: Fraction of total memory that should be available to collect data.\n"
-	printf "  --max-retries <max-retries-count>\t: No. of time agent should retry to send data.\n"
+	printf "  --monitored_interfaces <interfaces>\t: Interfaces that needs to be monitored.\n"
+	printf "  --verbose_mode <0, 1>\t\t\t: Run agent in verbose mode.\n"
+	printf "  --required_memory <0-1>\t\t: Fraction of total memory that should be available to collect data.\n"
+	printf "  --max_retries <max-retries-count>\t: No. of time agent should retry to send data.\n"
 	exit 0
 }
 
@@ -59,7 +53,8 @@ check_available_memory() {
 				rm "$file"
 			else
 				[ "$VERBOSE_MODE" -eq "1" ] \
-					&& logger -s "Not enough memory available, skipping collect data." -t openwisp-monitoring -p daemon.warn
+					&& logger -s "Not enough memory available, skipping collect data." \
+						-p daemon.warn
 				return 1
 			fi
 		fi
@@ -68,12 +63,13 @@ check_available_memory() {
 
 collect_data() {
 	n=0
-	[ "$VERBOSE_MODE" -eq "1" ] && logger -s "Collecting NetJSON Monitoring data." -t openwisp-monitoring -p daemon.info
+	[ "$VERBOSE_MODE" -eq "1" ] && logger -s "Collecting NetJSON Monitoring data." \
+		-p daemon.info
 	until [ "$n" -ge 5 ]; do
 		/usr/sbin/netjson-monitoring --dump "$MONITORED_INTERFACES" && break
 
 		if [ "$n" -eq 5 ]; then
-			[ "$VERBOSE_MODE" -eq "1" ] && logger -s "Collecting data failed!" -t openwisp-monitoring -p daemon.err
+			[ "$VERBOSE_MODE" -eq "1" ] && logger -s "Collecting data failed!" -p daemon.err
 		fi
 		n=$((n + 1))
 		sleep 5
@@ -101,123 +97,156 @@ set_url_and_curl() {
 }
 
 save_data() {
-	if check_available_memory; then
-		data="$(collect_data)"
-		filename="$(date -u +'%d-%m-%Y_%H:%M:%S')"
-		# save data with file_name
-		echo "$data" >"$TMP_DIR/$filename"
-		# compress data
-		gzip "$TMP_DIR/$filename"
-		[ "$VERBOSE_MODE" -eq "1" ] && logger -s "Data saved temporarily." -t openwisp-monitoring -p daemon.info
-	fi
+	while true; do
+		if check_available_memory; then
+			data="$(collect_data)"
+			filename="$(date -u +'%d-%m-%Y_%H:%M:%S')"
+			# save data with file_name
+			echo "$data" >"$TMP_DIR/$filename"
+			# compress data
+			gzip "$TMP_DIR/$filename"
+			[ "$VERBOSE_MODE" -eq "1" ] && logger -s "Data saved temporarily." \
+				-p daemon.info
+		fi
+		# get process id of the process sending data
+		pid=$(pgrep -f "openwisp-monitoring.*--mode send")
+		kill -SIGUSR1 "$pid"
+		sleep "$INTERVAL"
+	done
 }
 
-
 handle_sigusr1() {
-	[ "$VERBOSE_MODE" -eq "1" ] && logger -s "SIGUSR1 received! Sending data." -t openwisp-monitoring -p daemon.info
+	[ "$VERBOSE_MODE" -eq "1" ] && logger -s "SIGUSR1 received! Sending data." \
+		-p daemon.info
 	return 0
 }
 
 send_data() {
 	success=0
-
 	while true; do
-
 		for file in "$TMP_DIR"/*; do
-			# Skip non-regular files
-			# if [ ! -f "$file" ]; then
-			# 	[ "$VERBOSE_MODE" -eq 1 ] && logger -s "No data file found to send." -p daemon.info
-			# 	trap handle_sigusr1 USR1
-			# 	sleep "$INTERVAL" &
-			# 	wait $!
-			# 	continue
-			# fi
-
-			[ ! -f "$file" ] && continue
-
-			# Temporarily disable SIGUSR1 handling during processing
-			trap "" USR1
-
-			basefilename=${file##*/}
-			filename=${basefilename%.*}
-
-			# Remove old response file
-			if [ "$filename" = "response" ]; then
-				rm "$file" 2>/dev/null
+			if [ ! -f "$file" ]; then
+				[ "$VERBOSE_MODE" -eq "1" ] && logger -s "No data file found to send." \
+					-p daemon.info
+				trap handle_sigusr1 USR1
+				# SIGUSR1 signal received, interrupt sleep and continue sending data
+				sleep "$INTERVAL" &
+				wait $!
 				continue
 			fi
-
-			url="$BASE_URL/api/v1/monitoring/device/$UUID/?key=$KEY&time=${filename}.000000"
+			trap "" USR1
+			basefilename=${file##*/}
+			filename=${basefilename%.*}
+			# remove previous saved response if exist
+			[ "$filename" = "response" ] && rm "$file" 2>/dev/null && continue
+			# extra zeroes are added for nanoseconds precision
+			url="$URL&time=$filename.000000"
+			# retry sending data in case of failure
 			failures=0
-
-			# Decompress if gzipped
-			if [[ "${basefilename##*.}" = "gz" ]]; then
+			# check if the data is latest or old one
+			[ "$(echo "$TMP_DIR"/* | awk '{print $2}')" ] || url="$url&current=true"
+			if [ "${basefilename##*.}" = "gz" ]; then
+				# decompress file
 				gzip -d "$file"
-				file="${file%.gz}"
 			fi
-
 			filename="$TMP_DIR/$filename"
 			# check if the data file exist
 			if [ -f "$filename" ]; then
 				data=$(cat "$filename")
+			else
+				[ "$VERBOSE_MODE" -eq "1" ] && logger -s "data file $filename not found." \
+					-p daemon.info
+				continue
 			fi
-			
-
 			while true; do
-				# Send data via curl
+				if [ "$failures" -eq "$MAX_RETRIES" ]; then
+					[ -f "$RESPONSE_FILE" ] && error_message="\"$(cat "$RESPONSE_FILE")\"" || error_message='"".'
+					if [ "$VERBOSE_MODE" -eq "1" ]; then
+						logger -s "Data not sent successfully. Response code is \"$response_code\"." \
+							"Error message is $error_message" \
+							-p daemon.err
+					elif [ "$FAILING" -eq "0" ]; then
+						FAILING=1
+						logger -s "Data not sent successfully. Response code is \"$response_code\"." \
+							"Error message is $error_message" \
+							"Run with verbose mode to find more." \
+							-t openwisp-monitoring \
+							-p daemon.err
+					fi
+					break
+				fi
+				# send data
 				response_code=$($CURL_COMMAND -H "Content-Type: application/json" -d "$data" "$url")
-
 				if [ "$response_code" = "200" ]; then
 					success=$((success + 1))
-					[ "$VERBOSE_MODE" -eq 1 ] && logger -s "Data sent successfully: $basefilename" -t openwisp-monitoring  -p daemon.info
-
-					if [ "$FAILING" -eq 1 ]; then
-						[ "$VERBOSE_MODE" -eq 1 ] && logger -s "Recovered after failures." -t openwisp-monitoring -p daemon.info
+					if [ "$VERBOSE_MODE" -eq "1" ]; then
+						logger -s "Data sent successfully." \
+							-p daemon.info
+					elif [ "$FAILING" -eq "1" ]; then
+						logger -s "Data sent successfully." \
+							-t openwisp-monitoring \
+							-p daemon.info
 						FAILING=0
 						rm -f "$RESPONSE_FILE"
 					fi
-
 					# remove saved data
 					rm -f "$filename"
 					break
-
 				elif [ "$response_code" = "400" ]; then
-					[ "$VERBOSE_MODE" -eq 1 ] && logger -s "Data not sent (HTTP 400), discarding: $basefilename" -t openwisp-monitoring  -p daemon.err
-					rm -f "$file"
+					logger -s "Data not sent successfully (HTTP status $response_code), discarding data." \
+						-t openwisp-monitoring \
+						-p daemon.err
+					rm -f "$filename"
 					break
+				else
+					timeout=$(/usr/sbin/openwisp-get-random-number 2 15)
+					[ "$VERBOSE_MODE" -eq "1" ] && logger -s "Data not sent successfully. Retrying in $timeout seconds." \
+						-p daemon.warn
+					failures=$((failures + 1))
+					if [ "$response_code" = "404" ]; then
+						# If we get a HTTP 404 response, it could mean that the device has been deleted from OpenWISP
+						# Controller. We check if openwisp-config agent is running to determine if the device has been
+						# deleted. If openwisp-config agent is not running, the monitoring agent will also exit.
+						if ! pgrep -x "openwisp-config" >/dev/null; then
+							logger -s "Giving up and shutting down: the device may have been deleted from OpenWISP Controller" \
+								-t openwisp-monitoring \
+								-p daemon.err
+							# get process id of the process collecting data
+							pid=$(pgrep -f "openwisp-monitoring.*--mode collect")
+							kill -SIGKILL "$pid"
+							exit 2
+						fi
+					fi
+					sleep "$timeout"
 				fi
-
-				# Retry logic
-				failures=$((failures + 1))
-				if [ "$failures" -ge "$MAX_RETRIES" ]; then
-					err_msg=$([ -f "$RESPONSE_FILE" ] && tr -d '\n' < "$RESPONSE_FILE")
-					[ "$VERBOSE_MODE" -eq 1 ] && logger -s "Failed $basefilename after $failures tries: HTTP $response_code ($err_msg)" -t openwisp-monitoring -p daemon.err
-					FAILING=1
-					break
-				fi
-
-				[ "$VERBOSE_MODE" -eq 1 ] && logger -s "Retry #$failures for $basefilename in $((failures * 2))s" -t openwisp-monitoring -p daemon.warn
-				sleep $((failures * 2))
 			done
+			# retry sending same data again in next cycle
+			[ "$failures" -eq "$MAX_RETRIES" ] && break
+			# pause for a random time between 1 and 5 seconds every
+			# 10 successful requests sent to avoid overload the server
+			if [ $((success % 10)) -eq 0 ]; then
+				pause_duration=$(/usr/sbin/openwisp-get-random-number 1 5)
+				sleep "$pause_duration"
+			fi
 		done
-		
 	done
 }
-
 
 wait_until_registered() {
 	if [ -n "$UUID" ] && [ -n "$KEY" ]; then
 		return 0
 	fi
-	[ "$VERBOSE_MODE" -eq 1 ] && logger -s "Waiting for device to register." -t openwisp-monitoring -p daemon.info
-
+	logger -s "Waiting for device to register." \
+		-t openwisp-monitoring \
+		-p daemon.info
 	UUID=$(uci get openwisp.http.uuid 2>/dev/null)
 	KEY=$(uci get openwisp.http.key 2>/dev/null)
 	if [ -z "$UUID" ] || [ -z "$KEY" ]; then
 		return 1
 	fi
-	[ "$VERBOSE_MODE" -eq 1 ] && logger -s "Setting uuid and key." -t openwisp-monitoring -p daemon.info
-
+	logger -s "Setting uuid and key." \
+		-t openwisp-monitoring \
+		-p daemon.info
 	export UUID KEY
 }
 
@@ -227,43 +256,15 @@ bootup_delay() {
 		if [ "$BOOTUP_DELAY" -ne "0" ]; then
 			# get a random number between zero and $BOOTUP_DELAY
 			DELAY=$(/usr/sbin/openwisp-get-random-number 0 "$BOOTUP_DELAY")
-			[ "$VERBOSE_MODE" -eq 1 ] && logger "Delaying initialization of the monitoring agent for $DELAY seconds." -t openwisp-monitoring -p daemon.info
+			logger "Delaying initialization of the monitoring agent for $DELAY seconds." \
+				-t openwisp-monitoring \
+				-p daemon.info
 			sleep "$DELAY"
 		fi
 		# send bootup hotplug event
 		touch "$BOOTUP"
 	fi
 }
-
-#call this supervisor loop function for gather all data.
-collect_supervisor_loop() {
-	local last_save=0
-	local real_time_monitor=0
-	local last_ipsec_stat=0
-	local last_wan_status=0
-
-	while true; do
-		now=$(date +%s)
-
-		if [ $((now - last_save)) -ge "$INTERVAL" ]; then
-			save_data
-			last_save=$now
-		fi
-
-		if [ $((now - last_wan_status)) -ge "$INTERVAL_WAN_STATUS" ]; then
-			#/usr/sbin/wan_monitor.sh
-			last_wan_status=$now
-		fi
-
-		if [ $((now - last_ipsec_stat)) -ge "$INTERVAL_IPSEC" ]; then
-			/usr/sbin/ipsec_monitor.sh
-			last_ipsec_stat=$now
-		fi
-		
-		sleep 1  # prevent 100% CPU
-	done
-}
-
 
 main() {
 	# parse options
@@ -327,10 +328,6 @@ main() {
 				export BOOTUP_DELAY="$2"
 				shift
 				;;
-			--dpi-dump-path)
-				export DPI_DUMP_PATH="$2"
-				shift
-				;;
 			-*)
 				echo "Invalid option: $1"
 				exit 1
@@ -354,17 +351,13 @@ main() {
 
 	# make directory
 	mkdir -p "$TMP_DIR"
-	mkdir -p "$CACHE_DIR"
 
 	if [ "$MODE" = "collect" ]; then
 		bootup_delay
 		MONITORED_INTERFACES=${MONITORED_INTERFACES:-*}
 		# remove double quotes from interfaces
 		MONITORED_INTERFACES=$(echo "$MONITORED_INTERFACES" | tr -d '"')
-		
-		#save_data
-		# call this function to run all function with thier respective interval
-		collect_supervisor_loop
+		save_data
 	elif [ "$MODE" = "send" ]; then
 		until wait_until_registered; do
 			sleep "$REGISTRATION_INTERVAL"
@@ -378,5 +371,3 @@ main() {
 }
 
 main "$@"
-
-
