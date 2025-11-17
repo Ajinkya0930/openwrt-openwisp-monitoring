@@ -12,6 +12,8 @@ PKG_BUILD_DIR:=$(BUILD_DIR)/$(PKG_NAME)/$(PKG_SOURCE_SUBDIR)
 PKG_MAINTAINER:=Federico Capoano <f.capoano@openwisp.io>
 PKG_LICENSE:=GPL-3.0-or-later
 
+PKG_CONFIG_DEPENDS:=CONFIG_NETJSON_MONITORING_IWINFO
+
 include $(INCLUDE_DIR)/package.mk
 
 define Package/openwisp-monitoring
@@ -117,22 +119,70 @@ define Package/openwisp-monitoring/install
 		files/openwisp-monitoring.hotplug \
 		$(1)/etc/hotplug.d/openwisp/openwisp-monitoring
 
+	$(INSTALL_BIN) \
+		files/sbin/check_modem_ping.sh \
+		$(1)/usr/sbin/check_modem_ping.sh
+
+	$(INSTALL_BIN) \
+		files/sbin/mobile_data.sh \
+		$(1)/usr/sbin/mobile_data.sh
+
 	$(INSTALL_CONF) \
 		files/monitoring.config \
 		$(1)/etc/config/openwisp-monitoring
 
-	$(INSTALL_BIN) \
-		files/sbin/collect_dpi_client_data.py \
-		$(1)/usr/sbin/collect_dpi_client_data.py
-
-	$(INSTALL_BIN) \
-		files/sbin/wan_monitor.sh \
-		$(1)/usr/sbin/wan_monitor.sh
-	
-	$(INSTALL_BIN) \
-		files/sbin/ipsec_monitor.sh \
-		$(1)/usr/sbin/ipsec_monitor.sh
 endef
+
+# -------------------------
+# Add cron entries on install
+# -------------------------
+define Package/openwisp-monitoring/postinst
+#!/bin/sh
+
+CRONFILE="/etc/crontabs/root"
+CRON1="*/5 * * * * /usr/sbin/mobile_data.sh"
+CRON2="*/5 * * * * /usr/sbin/check_modem_ping.sh"
+
+# ensure crontabs dir exists
+[ -d "/etc/crontabs" ] || mkdir -p /etc/crontabs
+
+# create file if missing and add both lines, else append individually if missing
+if [ ! -f "$$CRONFILE" ]; then
+    echo "$$CRON1" > "$$CRONFILE"
+    echo "$$CRON2" >> "$$CRONFILE"
+else
+    grep -Fq "$$CRON1" "$$CRONFILE" || echo "$$CRON1" >> "$$CRONFILE"
+    grep -Fq "$$CRON2" "$$CRONFILE" || echo "$$CRON2" >> "$$CRONFILE"
+fi
+
+# restart cron to activate (no-op if cron not installed)
+[ -x "/etc/init.d/cron" ] && /etc/init.d/cron restart || true
+
+exit 0
+endef
+
+# -------------------------
+# Remove cron entries on uninstall
+# -------------------------
+define Package/openwisp-monitoring/prerm
+#!/bin/sh
+
+CRONFILE="/etc/crontabs/root"
+CRON1="*/5 * * * * /usr/sbin/mobile_data.sh"
+CRON2="*/15 * * * * /usr/sbin/check_modem_ping.sh"
+
+# remove only the exact lines we added (safe)
+if [ -f "$$CRONFILE" ]; then
+    sed -i "/^$$CRON1$$/d" "$$CRONFILE" 2>/dev/null || true
+    sed -i "/^$$CRON2$$/d" "$$CRONFILE" 2>/dev/null || true
+fi
+
+# restart cron to apply changes
+[ -x "/etc/init.d/cron" ] && /etc/init.d/cron restart || true
+
+exit 0
+endef
+
 
 $(eval $(call BuildPackage,openwisp-monitoring))
 $(eval $(call BuildPackage,netjson-monitoring))

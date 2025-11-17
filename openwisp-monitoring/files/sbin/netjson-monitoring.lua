@@ -4,8 +4,6 @@
 -- and return it as NetJSON Output
 package.path = package.path .. ";../files/lib/?.lua"
 
-local nixio = require("nixio")
-local uci = require("uci").cursor()
 local cjson = require('cjson')
 local io = require('io')
 
@@ -15,41 +13,325 @@ if not ubus then error('Failed to connect to ubusd') end
 
 local monitoring = require('openwisp-monitoring.monitoring')
 
--- collect system info
+----------------------------------------------------------------
+-- Helpers (safe ubus, fs/shell, parsing)
+----------------------------------------------------------------
+local function safe_ubus_call(obj, meth, args, timeout_ms)
+  if not ubus then return nil end
+  local ok, res = pcall(function()
+    return ubus:call(obj, meth, args or {}, timeout_ms or 1000)
+  end)
+  if ok then return res end
+  return nil
+end
+
+local function file_exists(path)
+  local f = io.open(path, "r")
+  if f then f:close() return true end
+  return false
+end
+
+local function read_first_line(path)
+  local f = io.open(path, "r")
+  if not f then return nil end
+  local l = f:read("*l"); f:close()
+  return l
+end
+
+local function read_all(path)
+  local f = io.open(path, "r"); if not f then return nil end
+  local d = f:read("*a"); f:close(); return d
+end
+
+local function sh(cmd)
+  local p = io.popen(cmd .. " 2>/dev/null")
+  if not p then return "" end
+  local out = p:read("*a"); p:close()
+  return out or ""
+end
+
+local function dedup_array(arr)
+  local seen, out = {}, {}
+  for _, v in ipairs(arr or {}) do
+    if v and v ~= "" and not seen[v] then
+      seen[v] = true
+      table.insert(out, v)
+    end
+  end
+  return out
+end
+
+-- Guard get_interface_info against implementations that rely on nil upvalues
+local function safe_get_interface_info(name, iface_tbl)
+  local ok, res = pcall(function()
+    return monitoring.interfaces.get_interface_info(name, iface_tbl)
+  end)
+  if ok and type(res) == "table" then
+    return res
+  end
+  return {} -- never propagate errors / nil
+end
+
+-- NEW: safe JSON reader
+local function read_json_file(path)
+  local txt = read_all(path)
+  if not txt or txt == "" then return nil end
+  local ok, obj = pcall(cjson.decode, txt)
+  if ok and type(obj) == "table" then return obj end
+  return nil
+end
+
+----------------------------------------------------------------
+-- ★ Normalizers & validators for OpenWISP schema
+----------------------------------------------------------------
+local function normalize_family(fam)
+  if fam == "inet"  then return "ipv4" end
+  if fam == "inet6" then return "ipv6" end
+  return fam
+end
+
+-- returns a valid 6-octet mac (lowercase) or nil to drop the field
+local function sanitize_mac(mac)
+  if not mac or mac == "" then return nil end
+  mac = mac:lower()
+  -- reject obvious bad cases (4-octet, all zeros in various lengths)
+  if mac == "00:00:00:00" or mac == "00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00" then
+    return nil
+  end
+  -- must be exactly 6 octets of hex
+  if not mac:match("^%x%x:%x%x:%x%x:%x%x:%x%x:%x%x$") then
+    return nil
+  end
+  -- optionally reject all-zeros 6-octet
+  if mac == "00:00:00:00:00:00" then
+    return nil
+  end
+  return mac
+end
+
+-- drop well-known tunnel/virtual ifaces which often violate schema
+local function is_bad_iface_name(name)
+  if not name then return true end
+  if name == "lo" then return true end
+  if name == "gre0" or name == "gretap0" or name == "sit0"
+     or name == "ip6tnl0" or name == "ip6_vti0" or name == "teql0"
+     or name == "tunl0" then
+    return true
+  end
+  -- generic tun/tap/wireguard devices (lack MACs)
+  if name:match("^tun%d+") or name:match("^tap%d+") then
+    return true
+  end
+  return false
+end
+
+----------------------------------------------------------------
+-- Interface enumeration (no network.device/network.wireless ubus)
+----------------------------------------------------------------
+local function list_ifaces()
+  local out = sh("ls -1 /sys/class/net")
+  local ifs = {}
+  for name in out:gmatch("([^\n]+)") do
+    if not is_bad_iface_name(name) and not monitoring.utils.is_excluded(name) then
+      table.insert(ifs, name)
+    end
+  end
+  return ifs
+end
+
+local function read_netdev_counters()
+  local map = {}
+  local txt = read_all("/proc/net/dev") or ""
+  -- Columns (per iface): RX bytes, packets, errs, drop, fifo, frame, compressed, multicast,
+  --                      TX bytes, packets, errs, drop, fifo, colls, carrier, compressed
+  for line in txt:gmatch("[^\n]+") do
+    local ifname, rest = line:match("^%s*([^:]+):%s*(.+)$")
+    if ifname and rest then
+      local rx_bytes, rx_packets, rx_errs, rx_drop,
+            tx_bytes, tx_packets, tx_errs, tx_drop =
+        rest:match("(%d+)%s+(%d+)%s+(%d+)%s+(%d+)%s+%d+%s+%d+%s+%d+%s+%d+%s+(%d+)%s+(%d+)%s+(%d+)%s+(%d+)")
+      if rx_bytes and tx_bytes then
+        map[ifname] = {
+          rx_bytes = tonumber(rx_bytes),
+          rx_packets = tonumber(rx_packets),
+          rx_errors = tonumber(rx_errs),
+          rx_dropped = tonumber(rx_drop),
+          tx_bytes = tonumber(tx_bytes),
+          tx_packets = tonumber(tx_packets),
+          tx_errors = tonumber(tx_errs),
+          tx_dropped = tonumber(tx_drop)
+        }
+      end
+    end
+  end
+  return map
+end
+
+local function iface_basic_info(name)
+  local info = {}
+  info.mtu = tonumber(read_first_line("/sys/class/net/"..name.."/mtu"))
+  info.mac = read_first_line("/sys/class/net/"..name.."/address")
+  -- Type inference
+  if file_exists("/sys/class/net/"..name.."/wireless") then
+    info.type = "wireless"
+  elseif file_exists("/sys/class/net/"..name.."/bridge") then
+    info.type = "bridge"
+  elseif file_exists("/sys/class/net/"..name.."/tun_flags") or name:match("^tun") or name:match("^tap") or name:match("^wg") then
+    info.type = "virtual"
+  elseif name == "modem" or name == "modem2" then
+    info.type = "mobile"
+  else
+    info.type = "ethernet"
+  end
+  -- State/speed
+  info.up = (read_first_line("/sys/class/net/"..name.."/operstate") == "up")
+  local speed = read_first_line("/sys/class/net/"..name.."/speed")
+  info.speed = speed and speed:gsub("%s+$", "") or nil
+  return info
+end
+
+local function iface_addresses()
+  local map = {}
+  local out = sh("ip -o addr show")
+  for line in out:gmatch("[^\n]+") do
+    -- example line formats:
+    -- 2: eth1    inet 192.168.6.210/24 brd 192.168.6.255 scope global eth1
+    -- 2: eth1    inet6 fe80::860a:9eff:fe15:103e/64 scope link
+    local ifname, fam, addr = line:match("^%d+:%s*([^%s]+)%s+([^%s]+)%s+([^%s]+)")
+    if ifname and fam and addr and (fam == "inet" or fam == "inet6") then
+      local ip, mask = addr:match("^([^/]+)/(%d+)$")
+      ip   = ip or addr
+      mask = tonumber(mask)
+
+      -- normalize family names for OpenWISP
+      local family = (fam == "inet") and "ipv4" or "ipv6"
+
+      -- strip any scope id from IPv6 like "fe80::...%eth0"
+      if family == "ipv6" then ip = ip:gsub("%%[%w._-]+$", "") end
+
+      map[ifname] = map[ifname] or {}
+      local entry = { family = family, address = ip }
+      if mask then entry.mask = mask end
+      table.insert(map[ifname], entry)
+    end
+  end
+  return map
+end
+
+
+
+local function bridge_members(name)
+  local dir = "/sys/class/net/"..name.."/brif"
+  local out = sh("[ -d "..dir.." ] && ls -1 "..dir.." || true")
+  local members = {}
+  for m in out:gmatch("([^\n]+)") do table.insert(members, m) end
+  return (#members > 0) and members or nil
+end
+
+----------------------------------------------------------------
+-- Wireless helpers via ubus (guarded)
+----------------------------------------------------------------
+local function iwinfo_via_ubus(dev)
+  return safe_ubus_call("iwinfo", "info", { device = dev }, 1000)
+end
+
+local function iwinfo_assoclist(dev)
+  local res = safe_ubus_call("iwinfo", "assoclist", { device = dev }, 1000)
+  return res and res.results or nil
+end
+
+local function hostapd_clients(dev)
+  local res = safe_ubus_call("hostapd."..dev, "get_clients", {}, 1000)
+  return res and res.clients or nil
+end
+
+----------------------------------------------------------------
+-- DNS (fast: OpenWrt resolv auto, fallback /etc/resolv.conf)
+----------------------------------------------------------------
+local function read_dns()
+  local servers, search = {}, {}
+  local path = "/tmp/resolv.conf.d/resolv.conf.auto"
+  if not file_exists(path) then path = "/etc/resolv.conf" end
+  local data = read_all(path) or ""
+  for line in data:gmatch("[^\n]+") do
+    local k, v = line:match("^(%S+)%s+(.+)$")
+    if k == "nameserver" then
+      table.insert(servers, v)
+    elseif k == "search" or k == "domain" then
+      for s in v:gmatch("(%S+)") do table.insert(search, s) end
+    end
+  end
+  return dedup_array(servers), dedup_array(search)
+end
+
+
+----------------------------------------------------------------
+-- read the eth interfaces file
+---------------------------------------------------------------
+local function read_iface_zone_mode(name)
+  local path = "/tmp/" .. name .. ".info"
+  local f = io.open(path, "r")
+  if not f then return nil end
+  local zone, mode
+  for line in f:lines() do
+    line = line:match("^%s*(.-)%s*$")
+    if line ~= "" then
+      local k, v = line:match("^(%S+)%s*:%s*(.-)%s*$")
+      if k and v then
+        k = k:lower()
+        if k == "zone" then zone = v end
+        if k == "mode" then mode = v end
+      end
+    end
+  end
+  f:close()
+  return { zone = zone, mode = mode }
+end
+
+----------------------------------------------------------------
+-- Collect system info (fast ubus)
+----------------------------------------------------------------
 local system_info = ubus:call('system', 'info', {})
-local board = ubus:call('system', 'board', {})
+local board       = ubus:call('system', 'board', {})
+
 local loadavg_file = io.popen('cat /proc/loadavg')
 local loadavg_output = loadavg_file:read()
 loadavg_file:close()
-loadavg_output = monitoring.utils.split(loadavg_output, ' ')
-local load_average = {
-  tonumber(loadavg_output[1]), tonumber(loadavg_output[2]),
-  tonumber(loadavg_output[3])
+local load_average = monitoring.utils.split(loadavg_output or "", ' ')
+load_average = {
+  tonumber(load_average[1]) or 0,
+  tonumber(load_average[2]) or 0,
+  tonumber(load_average[3]) or 0
 }
 
-local sernum_file = io.popen('cat /sys/class/dmi/id/board_serial')
-local serial_number = sernum_file:read()
-sernum_file:close()
+-- get the serial number of the device ------------------------
+local s = io.open("/tmp/device.info"):read("*a")
+local serial_num = s:match("devsn%s*[:=]%s*(%S+)") or ""
 
-
--- init netjson data structure
+----------------------------------------------------------------
+-- Init NetJSON
+----------------------------------------------------------------
 local netjson = {
   type = 'DeviceMonitoring',
+  device_type = '4g_5g_router',
   general = {
-    hostname = board.hostname,
+    hostname   = board.hostname,
     local_time = system_info.localtime,
-    uptime = system_info.uptime,
-    serialnumber = serial_number
+    uptime     = system_info.uptime,
+    serialnumber = serial_num
   },
   resources = {
-    load = load_average,
+    load   = load_average,
     memory = system_info.memory,
-    swap = system_info.swap,
-    cpus = monitoring.resources.get_cpus(),
-    disk = monitoring.resources.parse_disk_usage()
+    swap   = system_info.swap,
+    cpus   = monitoring.resources.get_cpus(),
+    disk   = monitoring.resources.parse_disk_usage()
   }
 }
 
+----------------------------------------------------------------
+-- DHCP leases and neighbors (existing helpers)
+----------------------------------------------------------------
 local dhcp_leases = monitoring.dhcp.get_dhcp_leases()
 if not monitoring.utils.is_table_empty(dhcp_leases) then
   netjson.dhcp_leases = dhcp_leases
@@ -60,432 +342,365 @@ if not monitoring.utils.is_table_empty(host_neighbors) then
   netjson.neighbors = host_neighbors
 end
 
--- determine the interfaces to monitor
+----------------------------------------------------------------
+-- Determine interfaces to monitor (argument: "*" or space-separated list)
+----------------------------------------------------------------
 local arg = {...}
 local traffic_monitored = arg[1]
 local include_stats = {}
-if traffic_monitored and traffic_monitored ~= '*' then
+local monitor_all = (traffic_monitored == '*')
+if traffic_monitored and not monitor_all then
   traffic_monitored = monitoring.utils.split(traffic_monitored, ' ')
   for _, name in pairs(traffic_monitored) do include_stats[name] = true end
 end
 
--- collect device data
-local network_status = ubus:call('network.device', 'status', {})
-local wireless_status = ubus:call('network.wireless', 'status', {})
-local vpn_interfaces = monitoring.interfaces.get_vpn_interfaces()
-local wireless_interfaces = {}
+----------------------------------------------------------------
+-- Collect device data (without slow ubus calls to network.device/wireless)
+----------------------------------------------------------------
+local vpn_interfaces  = monitoring.interfaces.get_vpn_interfaces() or {}
 local host_interfaces = {}
-local dns_servers = {}
-local dns_search = {}
+local dns_servers     = {}
+local dns_search      = {}
 
--- collect relevant wireless interface stats
-for _, radio in pairs(wireless_status) do
-  for _, interface in ipairs(radio.interfaces) do
-    local name = interface.ifname
-    local is_mesh = false
-    local clients = nil
-    if name and not monitoring.utils.is_excluded(name) then
-      local iwinfo = ubus:call('iwinfo', 'info', {device = name})
-      local netjson_interface = {
-        name = name,
-        type = 'wireless',
-        wireless = {
-          ssid = iwinfo.ssid,
-          mode = monitoring.wifi.iwinfo_modes[iwinfo.mode] or iwinfo.mode,
-          channel = iwinfo.channel,
-          frequency = iwinfo.frequency,
-          tx_power = iwinfo.txpower,
-          signal = iwinfo.signal,
-          noise = iwinfo.noise,
-          country = iwinfo.country
-        }
-      }
-      if iwinfo.mode == 'Ad-Hoc' or iwinfo.mode == 'Mesh Point' then
-        clients = ubus:call('iwinfo', 'assoclist', {device = name}).results
-        is_mesh = true
-      else
-        local hostapd_output = ubus:call('hostapd.' .. name, 'get_clients', {})
-        if hostapd_output then clients = hostapd_output.clients end
-      end
-      if not monitoring.utils.is_table_empty(clients) then
-        netjson_interface.wireless.clients =
-          monitoring.wifi.netjson_clients(clients, is_mesh)
-      end
-      wireless_interfaces[name] = netjson_interface
-    end
-  end
-end
+-- Interfaces
+local ifs       = list_ifaces()            -- ★ already excludes bad names
+local counters  = read_netdev_counters()
+local addr_map  = iface_addresses()
 
--- collect interface stats
-for name, interface in pairs(network_status) do
+for _, name in ipairs(ifs) do
   if not monitoring.utils.is_excluded(name) then
-    local netjson_interface = {
-      name = name,
-      type = string.lower(interface.type),
-      up = interface.up,
-      mac = interface.macaddr,
-      txqueuelen = interface.txqueuelen,
-      mtu = interface.mtu,
-      speed = interface.speed,
-      bridge_members = interface['bridge-members'],
-      multicast = interface.multicast
-    }
+    local b = iface_basic_info(name)
 
-    if interface['bridge-members'] ~= nil then
-      local bridge_members = {}
-      for _, bridge_member in ipairs(interface['bridge-members']) do
-        if network_status[bridge_member] then
-          local network_interface = network_status[bridge_member]
-          if network_interface.up and network_interface.present then
-            table.insert(bridge_members, bridge_member)
-          end
+    -- ★ sanitize MAC (nil = omit)
+    local mac = sanitize_mac(b.mac)
+
+    local netjson_interface = {
+      name  = name,
+      type  = b.type,
+      up    = b.up,
+      mtu   = b.mtu,
+      speed = b.speed
+    }
+    if mac then netjson_interface.mac = mac end
+
+    -- minimal merge: ONLY set zone and is_wan; do not touch other fields
+    local file_info = read_iface_zone_mode(name)
+    if file_info then
+      if file_info.zone and not netjson_interface.zone then
+        netjson_interface.role = string.lower(file_info.zone)
+      end
+
+      local zone_l = file_info.zone and string.lower(file_info.zone) or nil
+      local mode_l = file_info.mode and string.lower(file_info.mode) or nil
+      if (zone_l == "wan" or (mode_l and mode_l:match("^wan"))) and not netjson_interface.is_wan then
+        netjson_interface.is_wan = true
+      end
+    end
+
+
+    if b.type == "bridge" then
+      local members = bridge_members(name)
+      if members then netjson_interface.bridge_members = members end
+    end
+
+    -- Wireless enrichment (guarded via iwinfo/hostapd ubus)
+    if b.type == "wireless" then
+      local iw = iwinfo_via_ubus(name)
+      if iw then
+        netjson_interface.wireless = {
+          ssid      = iw.ssid,
+          mode      = monitoring.wifi.iwinfo_modes[iw.mode] or iw.mode,
+          channel   = iw.channel,
+          frequency = iw.frequency,
+          tx_power  = iw.txpower,
+          signal    = iw.signal,
+          noise     = iw.noise,
+          country   = iw.country
+        }
+        local clients, is_mesh = nil, false
+        if iw.mode == "Ad-Hoc" or iw.mode == "Mesh Point" then
+          clients = iwinfo_assoclist(name)
+          is_mesh = true
+        else
+          clients = hostapd_clients(name) or iwinfo_assoclist(name)
+        end
+        if clients and not monitoring.utils.is_table_empty(clients) then
+          netjson_interface.wireless.clients =
+            monitoring.wifi.netjson_clients(clients, is_mesh)
         end
       end
-      netjson_interface['bridge_members'] = bridge_members
+    elseif vpn_interfaces[name] then
+      -- keep "virtual" type label but we already filtered known-bad names
+      netjson_interface.type = "virtual"
     end
-    if wireless_interfaces[name] then
-      monitoring.utils.dict_merge(wireless_interfaces[name], netjson_interface)
-      interface.type = netjson_interface.type
-    end
-    if interface.type == 'Network device' then
-      local link_supported = interface['link-supported']
-      if link_supported and next(link_supported) then
-        netjson_interface.type = 'ethernet'
-        netjson_interface.link_supported = link_supported
-      elseif vpn_interfaces[name] then
-        netjson_interface.type = 'virtual'
-      else
-        netjson_interface.type = 'other'
+
+    -- Statistics (from /proc/net/dev) — produce flat-key statistics
+    if monitor_all or include_stats[name] then
+      local st = counters[name]
+      if st then
+        -- decide source values; we may need to swap rx<->tx first for wifi
+        local rx_bytes = st.rx_bytes
+        local rx_packets = st.rx_packets
+        local rx_errors = st.rx_errors
+        local rx_dropped = st.rx_dropped
+
+        local tx_bytes = st.tx_bytes
+        local tx_packets = st.tx_packets
+        local tx_errors = st.tx_errors
+        local tx_dropped = st.tx_dropped
+
+        if monitoring.wifi.needs_inversion(netjson_interface) then
+          -- swap rx <-> tx
+          rx_bytes, tx_bytes = tx_bytes, rx_bytes
+          rx_packets, tx_packets = tx_packets, rx_packets
+          rx_errors, tx_errors = tx_errors, rx_errors
+          rx_dropped, tx_dropped = tx_dropped, rx_dropped
+        end
+
+        -- build flat statistics object, only including keys that are non-nil
+        local stats = {}
+        if rx_bytes    ~= nil then stats.rx_bytes    = rx_bytes    end
+        if rx_packets  ~= nil then stats.rx_packets  = rx_packets  end
+        if rx_errors   ~= nil then stats.rx_errors   = rx_errors   end
+        if rx_dropped  ~= nil then stats.rx_dropped  = rx_dropped  end
+
+        if tx_bytes    ~= nil then stats.tx_bytes    = tx_bytes    end
+        if tx_packets  ~= nil then stats.tx_packets  = tx_packets  end
+        if tx_errors   ~= nil then stats.tx_errors   = tx_errors   end
+        if tx_dropped  ~= nil then stats.tx_dropped  = tx_dropped  end
+
+        netjson_interface.statistics = stats
       end
     end
-    if include_stats[name] or traffic_monitored == '*' then
-      if monitoring.wifi.needs_inversion(netjson_interface) then
-        interface.statistics = monitoring.wifi.invert_rx_tx(interface.statistics)
-      end
-      netjson_interface.statistics = interface.statistics
+
+    -- IP addresses (already normalized to ipv4/ipv6)
+    local addrs = addr_map[name]
+    if addrs and next(addrs) then
+      netjson_interface.addresses = addrs
     end
-    local addresses = monitoring.interfaces.get_addresses(name)
-    if next(addresses) then netjson_interface.addresses = addresses end
-    local info = monitoring.interfaces.get_interface_info(name, netjson_interface)
+
+    -- Specialized interface info (guarded)
+    local info = safe_get_interface_info(name, netjson_interface)
     if info.stp ~= nil then netjson_interface.stp = info.stp end
-    if info.specialized then
-      for key, value in pairs(info.specialized) do netjson_interface[key] = value end
+    if type(info.specialized) == "table" then
+      for k, v in pairs(info.specialized) do netjson_interface[k] = v end
     end
-    table.insert(host_interfaces, netjson_interface)
-    if info.dns_servers then
+    if type(info.dns_servers) == "table" then
       monitoring.utils.array_concat(info.dns_servers, dns_servers)
     end
-    if info.dns_search then
+    if type(info.dns_search) == "table" then
       monitoring.utils.array_concat(info.dns_search, dns_search)
     end
+
+    table.insert(host_interfaces, netjson_interface)
   end
 end
 
-if next(host_interfaces) ~= nil then netjson.interfaces = host_interfaces end
-if next(dns_servers) ~= nil then netjson.dns_servers = dns_servers end
-if next(dns_search) ~= nil then netjson.dns_search = dns_search end
+-- NEW: map mobile JSON -> interface entry and append
+local function mobile_to_interface(mobj, idx)
+  -- mobj is the value of decoded_json.mobile
+  if type(mobj) ~= "table" then return nil end
 
+  local parse_name = (idx == 1) and "modem" or "modem2"
 
--- This function is common to all when we read the data from the /etc/config file..................................                                               
-local function read_config(config_name)
-    local result = {}
-
-    -- Check if config file exists
-    if not nixio.fs.access("/etc/config/" .. config_name) then
-        return result  -- return empty table if missing
-    end
-
-    -- Function to rename keys starting with "."
-    local function remove_dot_prefix(tbl)
-        local cleaned = {}
-        for k, v in pairs(tbl) do
-            if string.sub(k, 1, 1) == "." then
-                cleaned[string.sub(k, 2)] = v  -- remove first character "."
-            else
-                cleaned[k] = v
-            end
-        end
-        return cleaned
-    end
-
-    -- Read all sections and clean key names
-    uci:foreach(config_name, nil, function(s)
-        result[#result+1] = remove_dot_prefix(s)
-    end)
-
-    return result
+  local iface = {
+    name = parse_name,
+    type = "mobile",
+    up   = (mobj.connection_status == "connected")
+  }
+  -- keep everything under a namespaced key to avoid clashing with common iface keys
+  iface.mobile = {
+    imei              = mobj.imei,
+    operator_code     = mobj.operator_code,
+    operator_name     = mobj.operator_name,
+    connection_status = mobj.connection_status,
+    power_status  = mobj.power_status,
+    manufacturer      = mobj.manufacturer,
+    model             = mobj.model,
+    signal            = mobj.signal
+  }
+  return iface
 end
 
--- This function for /etc/frr/ read config from this files.......................................................
-local function read_frr_config(filename)
-    local result = {}
-    local full_path = "/etc/frr/" .. filename
-    if not nixio.fs.access(full_path) then
-        return result
-    end
-    local file = io.open(full_path, "r")
-    if file then
-        result.content = file:read("*all")
-        file:close()
-    end
-    return result
-end
- 
--- Collect data of System ......taking data of snmp,tr069,icmp check, schedule
-netjson.system = {
-	snmp      = read_config("snmp"),
-	tr069     = read_config("tr069"),
-	icmpcheck = read_config("icmpcheck"),
-	schedule  = read_config("schedule")
-}
-
--- Add firewall information
-netjson.firewall = {
-    port_forward = {
-	ubus:call('ns.redirects', 'list-redirects', {}) or {}
-    },
-    nat = {
-	rules = ubus:call('ns.nat', 'list-rules', {}) or {},
-	netmap = ubus:call('ns.netmap', 'list-rules', {}) or {},
-	nat_helper = ubus:call('ns.nathelpers', 'list-nat-helpers', {}) or {}
-    },
-    rules = {
- 	zones = ubus:call('ns.firewall', 'list_zones', {}) or {},
- 	forwardings = ubus:call('ns.firewall', 'list_forwardings', {}) or {},
- 	input_rules = ubus:call('ns.firewall', 'list-input-rules', {}) or {},
-	output_rules = ubus:call('ns.firewall', 'list-output-rules', {}) or {},
-	forward_rules = ubus:call('ns.firewall', 'list-forward-rules', {}) or {},
-	redirects = ubus:call('ns.firewall', 'list_redirects', {}) or {}
-    },
-    connections = {
-	ubus:call('ns.conntrack', 'list', {}) or {}
-    }
-}
-
-
--- Collect data of Network --> DNS and DHCP tab.
-netjson.network = {
-    DNS_DHCP = {
-	DHCP_MAC = ubus:call('ns.dhcp', 'list-interfaces', {}) or {} ,
-	Static_Lease = ubus:call('ns.dhcp', 'list-static-leases', {}) or {} ,
-	Dynamic_Lease = ubus:call('ns.dhcp', 'list-active-leases', {}) or {} ,
-	DNS = ubus:call('ns.dns', 'get-config', {}) or {} ,
-	DNS_Records = ubus:call('ns.dns', 'list-records', {}) or {} ,
- 	Scan_Network = ubus:call('ns.scan', 'list-interfaces', {}) or {} 
-    },
-    Routes = {
-	IPV4_Routes = ubus:call('ns.routes', 'list-routes', {protocol = 'ipv4'}) or {},
-	IPV4_Maintable = ubus:call('ns.routes', 'main-table', {protocol = 'ipv4'}) or {},
-	IPV6_Routes = ubus:call('ns.routes', 'list-routes', {protocol = 'ipv6'}) or {},
-	IPV6_Maintable = ubus:call('ns.routes', 'main-table', {protocol = 'ipv6'}) or {}
-    },
-    VxLan = read_config("vxlan"), 
-    FlowEdge_Multiwan = {
-	Multiwan_Manager = { Manager_Policy = ubus:call('ns.mwan', 'index_policies', {}) or {},
-	Manager_Rules = ubus:call('ns.mwan', 'index_rules', {}) or {} },
-	General_Settings = { ubus:call('ns.mwan', 'get_default_config', {}) or {}}
-    },
-    LoadBalance = read_config("loadbalance"),
-    Reverse_Proxy = { ubus:call('ns.reverseproxy', 'list-proxies', {}) or {} },
-    QoS = { ubus:call('ns.qos', 'list', {}) or {} },
-    Advanced_QoS = read_config("advance_qos"),
-    RIP = read_frr_config("ripd.conf"),
-    OSPF = read_frr_config("ospfd.conf"),
-    BGP = read_frr_config("bgpd.conf"),
-    VRF = read_config("vrf")
-    
-}
-
--- Collect data of VPN tab 
-netjson.vpn = {
-	OpenVPN_Tunnel = { ubus:call('ns.ovpntunnel', 'list-tunnels', {}) or {} },
-	IPSec_Tunnel = { server_tunnel = read_config("ipsec"),
-	Static_Lease = ubus:call('ns.ipsectunnel', 'list-tunnels', {}) or {} },
-	L2TP = { server = read_config("l2tp_server") }, 
-	VRRP = read_config("vrrp"),
-	ZeroTier = read_config("zerotier"),
-	Wireguard = { server = read_config("wireguard") },
-	OpenVPN = {
-		Instance = ubus:call('ns.ovpnrw', 'list-instances', {}) or {},
-		Configuration = ubus:call('ns.ovpnrw', 'get-configuration', { instance = "ns_roadwarrior1" }) or {}
-    }
-}
-
--- Collect Security data from tab
-netjson.security = {
-     InstaShield_Field = {
-	blocklist_feeds = ubus:call('ns.threatshield', 'list-blocklist', {}) or {},
-	local_allowlist = ubus:call('ns.threatshield', 'list-allowed', {}) or {},
-	local_blocklist = ubus:call('ns.threatshield', 'list-blocked', {}) or {},
-	settings = ubus:call('ns.threatshield', 'list-settings', {}) or {}
-     },
-     Instashield_DNS = {
-	blocklist_sources = ubus:call('ns.threatshield', 'dns-list-blocklist', {}) or {},
-	Filter_bypass = ubus:call('ns.threatshield', 'dns-list-bypass', {}) or {},
-	local_blocklist = ubus:call('ns.threatshield', 'dns-list-blocked', {}) or {},
-	settings = ubus:call('ns.threatshield', 'dns-list-settings', {}) or {}
-     },
-     DPI = {
-	rules = ubus:call('ns.dpi', 'list-rules', {}) or {},
-	exceptions = ubus:call('ns.dpi', 'list-exemptions', {}) or {}
-     },
-     IPS = {
-	today_event_list = ubus:call('ns.snort', 'list-events', {}) or {},
-        filter_bypass = ubus:call('ns.snort', 'list-bypasses', {}) or {},
-        disabled_rules = ubus:call('ns.snort', 'list-disabled-rules', {}) or {},
-        suppressed_alerts = ubus:call('ns.snort', 'list-suppressed-alerts', {}) or {},
-        settings = ubus:call('ns.snort', 'settings', {}) or {}
-     },
-     Antivirus = read_config("clamv"),
-     Antispam = read_config("rspamd")
-
-}
-
--- Collect Real Time Monitor Data.
--- this will get the dpi agent data from the another script -------------------
-local dpi_summary_client = "/tmp/monitoring_agent/realtime_monitor/dpi_summary_by_client.json"
-local python_status = os.execute("/usr/bin/python3 /usr/sbin/collect_dpi_client_data.py >/dev/null 2>&1")
-local dpiclient_data = {}
-if python_status == 0 then
-  -- Python script ran successfully
-  local file = io.open(dpi_summary_client, "r")
-  if file then
-    local content = file:read("*a")
-    file:close()
-    os.remove(dpi_summary_client)
-
-    -- decode JSON safely
-    local ok, decoded = pcall(cjson.decode, content)
-    if ok then
-      dpiclient_data = decoded
-    else
-      dpiclient_data = {}
-    end
-  else
-    -- file not found
-    dpiclient_data = {}
+do
+  local j1 = read_json_file("/tmp/mobile1.json")
+  if j1 and type(j1.mobile) == "table" then
+    local i1 = mobile_to_interface(j1.mobile, 1)
+    if i1 then table.insert(host_interfaces, i1) end
   end
-else
-  -- python failed
-  dpiclient_data = {}
+  local j2 = read_json_file("/tmp/mobile2.json")
+  if j2 and type(j2.mobile) == "table" then
+    local i2 = mobile_to_interface(j2.mobile, 2)
+    if i2 then table.insert(host_interfaces, i2) end
+  end
 end
---------------------------------------------------------------------
--- Read wan uplink data
--- Function to sanitize tables: ensures all keys are strings
-local function sanitize_table(t)
-    if type(t) ~= "table" then return t end
-    local res = {}
-    for k, v in pairs(t) do
-        local key = tostring(k)
-        if type(v) == "table" then
-            res[key] = sanitize_table(v)
+
+
+-- === Attach ping measurements from /tmp/ping_results.json to matching interfaces ===
+
+local function iface_matches_srcip(iface, srcip)
+  if not srcip then return false end
+  if not iface.addresses then return false end
+
+  for _, a in pairs(iface.addresses) do
+    if type(a) == "string" then
+      if a == srcip then return true end
+    elseif type(a) == "table" then
+      if a.address == srcip or a.ip == srcip or a.addr == srcip then return true end
+      for _, v in pairs(a) do
+        if type(v) == "string" and v == srcip then return true end
+      end
+    end
+  end
+  return false
+end
+
+local function find_host_interface(name, srcip)
+  for _, iface in ipairs(host_interfaces) do
+    if name and iface.name == name then return iface end
+    if srcip and iface_matches_srcip(iface, srcip) then return iface end
+  end
+  return nil
+end
+
+-- scan record for any throughput* keys and normalize into a throughput table
+local function extract_throughput_from_record(rec)
+  if type(rec) ~= "table" then return nil end
+  local thr = {}
+  local any = false
+  for k, v in pairs(rec) do
+    if type(k) == "string" and k:match("^throughput") then
+      -- normalize key names: e.g. throughput_rx_bytes_per_s -> rx_bytes_per_s
+      local nk = k:gsub("^throughput_", "")
+      -- coerce numeric strings to numbers (preserve numbers as-is)
+      if type(v) == "string" then
+        local n = tonumber(v)
+        if n ~= nil then
+          thr[nk] = n
         else
-            res[key] = v
+          thr[nk] = v
         end
+      else
+        thr[nk] = v
+      end
+      any = true
     end
-    return res
+  end
+  if any then return thr end
+  return nil
 end
 
--- Run your UBUS command and capture output
-local handle = io.popen("ubus call ns.report mwan-report 2>/dev/null | sed 's/^[[:space:]]*//'")
-local output = handle:read("*a")
-handle:close()
+do
+  local ping_file = "/tmp/ping_results.json"
+  local pings = read_json_file(ping_file)
+  if pings and type(pings) == "table" then
+    for _, rec in ipairs(pings) do
+      local ifname = rec["interface"] or rec.interface
+      local srcip  = rec["src ip"] or rec["src_ip"] or rec.src_ip or rec["src"] or rec.src
 
--- Fallback to empty JSON if output is empty
-if not output or output == "" then
-    output = "{}"
-end
+      local target_iface = find_host_interface(ifname, srcip)
+      if target_iface then
+        local ping_obj = {
+          dest_ip     = rec["dest ip"] or rec.dest_ip or rec.dest,
+          timestamp   = rec.timestamp,
+          latency_ms  = (rec.latency_ms ~= nil) and tonumber(rec.latency_ms) or rec.latency_ms,
+          jitter_ms   = (rec.jitter_ms  ~= nil) and tonumber(rec.jitter_ms)  or rec.jitter_ms,
+          packet_loss = rec.packet_loss or rec.packet_loss_percent or rec.loss
+        }
 
--- Decode JSON safely
-local wanevents = {}
-local ok, decoded = pcall(cjson.decode, output)
-if ok and type(decoded) == "table" then
-    wanevents = sanitize_table(decoded)
-else
-    wanevents = {}
-end
-
-------------------------------------------------------
--- Table to hold WAN traffic
-local wantraffic = {}
-
--- Get list of WAN devices
-local h = io.popen("ubus call ns.dashboard list-wans")
-local devices_output = h:read("*a")
-h:close()
-
-if devices_output and devices_output ~= "" then
-    local ok, devices_decoded = pcall(cjson.decode, devices_output)
-    if ok and devices_decoded.result then
-        for _, dev_table in ipairs(devices_decoded.result) do
-            local dev_name = dev_table.device  -- <<< extract the string here!
-            if dev_name then
-                -- Get interface traffic for this device
-                local h2 = io.popen('ubus call ns.dashboard interface-traffic "{\\"interface\\":\\"' .. dev_name .. '\\"}"')
-                local stats_output = h2:read("*a")
-                h2:close()
-
-                local stats_table = {}
-                if stats_output and stats_output ~= "" then
-                    local ok2, stats_decoded = pcall(cjson.decode, stats_output)
-                    if ok2 and type(stats_decoded) == "table" then
-                        stats_table = sanitize_table(stats_decoded)
-                    end
-                end
-
-                wantraffic[dev_name] = stats_table
-            end
+        local thr = extract_throughput_from_record(rec)
+        if thr then
+          ping_obj.throughput = thr
+        else
+          -- if you prefer to keep an empty table instead of `nil` when throughput absent,
+          -- uncomment the next line:
+          -- ping_obj.throughput = {}
         end
+
+        target_iface.ping = ping_obj
+      else
+        if not monitoring._orphan_pings then monitoring._orphan_pings = {} end
+        table.insert(monitoring._orphan_pings, rec)
+      end
     end
+  end
+end
+-- === end ping block ===
+
+
+-- System-level DNS (fast path)
+local sys_dns_servers, sys_dns_search = read_dns()
+for _, v in ipairs(sys_dns_servers or {}) do table.insert(dns_servers, v) end
+for _, v in ipairs(sys_dns_search or {}) do table.insert(dns_search, v) end
+dns_servers = dedup_array(dns_servers)
+dns_search  = dedup_array(dns_search)
+
+----------------------------------------------------------------
+-- Finalize NetJSON
+----------------------------------------------------------------
+if next(host_interfaces) ~= nil then netjson.interfaces = host_interfaces end
+if next(dns_servers)   ~= nil then netjson.dns_servers = dns_servers end
+if next(dns_search)    ~= nil then netjson.dns_search  = dns_search  end
+
+
+----------------------------------------------------------------
+-- Below data is of MODEM1 and MODEM2 
+----------------------------------------------------------------
+-- Read all key:value pairs from a file into a table (raw strings)
+local function read_kv_file(path)
+  local t = {}
+  local fh, err = io.open(path, "r")
+  if not fh then
+    return nil, ("failed to open %s: %s"):format(path, tostring(err))
+  end
+
+  for line in fh:lines() do
+    -- capture any key (including spaces) up to the first colon, trim surrounding whitespace
+    local k, v = line:match("^%s*(.-)%s*:%s*(.*)$")
+    if k then
+      -- keep exactly as read (may be empty string)
+      t[k] = v
+    end
+  end
+
+  fh:close()
+  return t
 end
 
----------------------------------------------------
--- Step 1: Run UBUS command to read the wan lat and qua data
-local handle = io.popen("ubus call ns.report latency-and-quality-report 2>/dev/null")
-local output = handle:read("*a")
-handle:close()
+netjson.cellular = {
+  modem = read_kv_file("/tmp/modem_data.info"),
+  modem2 = read_kv_file("/tmp/modem_data2.info")
+}
 
--- Step 2: Fix malformed output like "{{ ... }}" (remove extra braces)
-if output:match("^%s*{[%s]*{") then
-    output = output:gsub("^%s*{[%s]*{", "{"):gsub("}[%s]*}$", "}")
-end
+netjson.wlan = {
+  wlan_data = read_kv_file("/tmp/wlan.info")
+}
 
--- Step 3: If empty or just '{}', fallback to empty table
-if not output or output:match("^%s*$") or output:match("^%s*{}%s*$") then
-    output = "{}"
-end
+netjson.device = {
+  device_info = read_kv_file("/tmp/device.info")
+}
 
--- Step 4: Decode JSON safely
-local wan_latquality = {}
-local ok, decoded = pcall(cjson.decode, output)
-if ok and type(decoded) == "table" then
-    wan_latquality = sanitize_table(decoded)
-else
-    wan_latquality = {}
-end
+netjson.ethernet = {
+  eth1_data = read_kv_file("/tmp/eth1.info"),
+  eth2_data = read_kv_file("/tmp/eth2.info"),
+  eth3_data = read_kv_file("/tmp/eth3.info"),
+  eth4_data = read_kv_file("/tmp/eth4.info"),
+  eth5_data = read_kv_file("/tmp/eth5.info")
+}
 
-netjson.realtimemonitor = {
-	traffic = {
-		dpi_summery_v2=ubus:call('ns.dpireport' ,'summary-v2' , {}) or {},
-		dpi_client_data= dpiclient_data
-	},
-	security = {
-		blocklist=ubus:call('ns.report' ,'tsip-malware-report' , {}) or {},
-		brute_force_attack=ubus:call('ns.report' ,'tsip-attack-report', {}) or {}
-	},
-	real_time_traffic = {
-		data=ubus:call('ns.talkers' , 'list' , {}) or {}
-	},
-	wan_uplink = {
-		wan_events = wanevents,
-		wan_traffic = wantraffic,
-		wan_lat_qua = wan_latquality
-	}
-	
+netjson.dpi = {
+  data = read_kv_file("/tmp/dpi.info")
+}
+
+netjson.performance_sla = {
+  data = read_kv_file("/tmp/performance_sla.info")
+}
+
+netjson.zone_firewall = {
+  data = read_kv_file("/tmp/zone_firewall.info")
 }
 
 io.write(cjson.encode(netjson))
 return cjson.encode(netjson)
-
 
 
