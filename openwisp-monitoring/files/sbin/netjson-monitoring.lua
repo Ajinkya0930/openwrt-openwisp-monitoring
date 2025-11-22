@@ -1,7 +1,5 @@
 #!/usr/bin/env lua
-
--- retrieve monitoring information
--- and return it as NetJSON Output
+-- sample_netjson.lua  (fixed unmatched 'end' issue)
 package.path = package.path .. ";../files/lib/?.lua"
 
 local cjson = require('cjson')
@@ -61,7 +59,6 @@ local function dedup_array(arr)
   return out
 end
 
--- Guard get_interface_info against implementations that rely on nil upvalues
 local function safe_get_interface_info(name, iface_tbl)
   local ok, res = pcall(function()
     return monitoring.interfaces.get_interface_info(name, iface_tbl)
@@ -69,20 +66,27 @@ local function safe_get_interface_info(name, iface_tbl)
   if ok and type(res) == "table" then
     return res
   end
-  return {} -- never propagate errors / nil
-end
-
--- NEW: safe JSON reader
-local function read_json_file(path)
-  local txt = read_all(path)
-  if not txt or txt == "" then return nil end
-  local ok, obj = pcall(cjson.decode, txt)
-  if ok and type(obj) == "table" then return obj end
-  return nil
+  return {}
 end
 
 ----------------------------------------------------------------
--- ★ Normalizers & validators for OpenWISP schema
+-- Single robust JSON reader used everywhere
+-- returns table or nil,err
+----------------------------------------------------------------
+local function read_json_file(path)
+  if type(path) ~= "string" then return nil, "path must be string" end
+  local f, err = io.open(path, "rb")
+  if not f then return nil, ("failed to open %s: %s"):format(path, tostring(err)) end
+  local content = f:read("*a")
+  f:close()
+  if not content or content == "" then return nil, ("empty file: %s"):format(path) end
+  local ok, decoded = pcall(cjson.decode, content)
+  if not ok then return nil, ("json decode error: %s"):format(tostring(decoded)) end
+  return decoded
+end
+
+----------------------------------------------------------------
+-- Normalizers & validators
 ----------------------------------------------------------------
 local function normalize_family(fam)
   if fam == "inet"  then return "ipv4" end
@@ -90,26 +94,21 @@ local function normalize_family(fam)
   return fam
 end
 
--- returns a valid 6-octet mac (lowercase) or nil to drop the field
 local function sanitize_mac(mac)
   if not mac or mac == "" then return nil end
   mac = mac:lower()
-  -- reject obvious bad cases (4-octet, all zeros in various lengths)
   if mac == "00:00:00:00" or mac == "00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00" then
     return nil
   end
-  -- must be exactly 6 octets of hex
   if not mac:match("^%x%x:%x%x:%x%x:%x%x:%x%x:%x%x$") then
     return nil
   end
-  -- optionally reject all-zeros 6-octet
   if mac == "00:00:00:00:00:00" then
     return nil
   end
   return mac
 end
 
--- drop well-known tunnel/virtual ifaces which often violate schema
 local function is_bad_iface_name(name)
   if not name then return true end
   if name == "lo" then return true end
@@ -118,15 +117,22 @@ local function is_bad_iface_name(name)
      or name == "tunl0" then
     return true
   end
-  -- generic tun/tap/wireguard devices (lack MACs)
   if name:match("^tun%d+") or name:match("^tap%d+") then
     return true
   end
   return false
 end
 
+local function map_iface_name_to_eth(name)
+  if not name then return name end
+  local n = name:match("^lan(%d+)$")
+  if n then return "eth" .. n end
+  if name == "inter-lan" then return "eth0" end
+  return name
+end
+
 ----------------------------------------------------------------
--- Interface enumeration (no network.device/network.wireless ubus)
+-- Interface enumeration helpers
 ----------------------------------------------------------------
 local function list_ifaces()
   local out = sh("ls -1 /sys/class/net")
@@ -142,8 +148,6 @@ end
 local function read_netdev_counters()
   local map = {}
   local txt = read_all("/proc/net/dev") or ""
-  -- Columns (per iface): RX bytes, packets, errs, drop, fifo, frame, compressed, multicast,
-  --                      TX bytes, packets, errs, drop, fifo, colls, carrier, compressed
   for line in txt:gmatch("[^\n]+") do
     local ifname, rest = line:match("^%s*([^:]+):%s*(.+)$")
     if ifname and rest then
@@ -171,7 +175,6 @@ local function iface_basic_info(name)
   local info = {}
   info.mtu = tonumber(read_first_line("/sys/class/net/"..name.."/mtu"))
   info.mac = read_first_line("/sys/class/net/"..name.."/address")
-  -- Type inference
   if file_exists("/sys/class/net/"..name.."/wireless") then
     info.type = "wireless"
   elseif file_exists("/sys/class/net/"..name.."/bridge") then
@@ -183,7 +186,6 @@ local function iface_basic_info(name)
   else
     info.type = "ethernet"
   end
-  -- State/speed
   info.up = (read_first_line("/sys/class/net/"..name.."/operstate") == "up")
   local speed = read_first_line("/sys/class/net/"..name.."/speed")
   info.speed = speed and speed:gsub("%s+$", "") or nil
@@ -194,21 +196,13 @@ local function iface_addresses()
   local map = {}
   local out = sh("ip -o addr show")
   for line in out:gmatch("[^\n]+") do
-    -- example line formats:
-    -- 2: eth1    inet 192.168.6.210/24 brd 192.168.6.255 scope global eth1
-    -- 2: eth1    inet6 fe80::860a:9eff:fe15:103e/64 scope link
     local ifname, fam, addr = line:match("^%d+:%s*([^%s]+)%s+([^%s]+)%s+([^%s]+)")
     if ifname and fam and addr and (fam == "inet" or fam == "inet6") then
       local ip, mask = addr:match("^([^/]+)/(%d+)$")
       ip   = ip or addr
       mask = tonumber(mask)
-
-      -- normalize family names for OpenWISP
       local family = (fam == "inet") and "ipv4" or "ipv6"
-
-      -- strip any scope id from IPv6 like "fe80::...%eth0"
       if family == "ipv6" then ip = ip:gsub("%%[%w._-]+$", "") end
-
       map[ifname] = map[ifname] or {}
       local entry = { family = family, address = ip }
       if mask then entry.mask = mask end
@@ -217,8 +211,6 @@ local function iface_addresses()
   end
   return map
 end
-
-
 
 local function bridge_members(name)
   local dir = "/sys/class/net/"..name.."/brif"
@@ -246,7 +238,7 @@ local function hostapd_clients(dev)
 end
 
 ----------------------------------------------------------------
--- DNS (fast: OpenWrt resolv auto, fallback /etc/resolv.conf)
+-- DNS helpers
 ----------------------------------------------------------------
 local function read_dns()
   local servers, search = {}, {}
@@ -264,10 +256,9 @@ local function read_dns()
   return dedup_array(servers), dedup_array(search)
 end
 
-
 ----------------------------------------------------------------
 -- read the eth interfaces file
----------------------------------------------------------------
+----------------------------------------------------------------
 local function read_iface_zone_mode(name)
   local path = "/tmp/" .. name .. ".info"
   local f = io.open(path, "r")
@@ -304,10 +295,11 @@ load_average = {
   tonumber(load_average[3]) or 0
 }
 
--- get the serial number of the device ------------------------
-local s = io.open("/tmp/device.info"):read("*a")
-local serial_num = s:match("devsn%s*[:=]%s*(%S+)") or ""
-
+local serial_num = ""
+if file_exists("/tmp/device.info") then
+  local s = read_all("/tmp/device.info") or ""
+  serial_num = s:match("devsn%s*[:=]%s*(%S+)") or ""
+end
 ----------------------------------------------------------------
 -- Init NetJSON
 ----------------------------------------------------------------
@@ -330,7 +322,7 @@ local netjson = {
 }
 
 ----------------------------------------------------------------
--- DHCP leases and neighbors (existing helpers)
+-- DHCP leases and neighbors
 ----------------------------------------------------------------
 local dhcp_leases = monitoring.dhcp.get_dhcp_leases()
 if not monitoring.utils.is_table_empty(dhcp_leases) then
@@ -363,19 +355,18 @@ local dns_servers     = {}
 local dns_search      = {}
 
 -- Interfaces
-local ifs       = list_ifaces()            -- ★ already excludes bad names
+local ifs       = list_ifaces()
 local counters  = read_netdev_counters()
 local addr_map  = iface_addresses()
 
 for _, name in ipairs(ifs) do
   if not monitoring.utils.is_excluded(name) then
     local b = iface_basic_info(name)
-
-    -- ★ sanitize MAC (nil = omit)
     local mac = sanitize_mac(b.mac)
+    local mapped_name = map_iface_name_to_eth(name)
 
     local netjson_interface = {
-      name  = name,
+      name  = mapped_name,
       type  = b.type,
       up    = b.up,
       mtu   = b.mtu,
@@ -383,7 +374,6 @@ for _, name in ipairs(ifs) do
     }
     if mac then netjson_interface.mac = mac end
 
-    -- minimal merge: ONLY set zone and is_wan; do not touch other fields
     local file_info = read_iface_zone_mode(name)
     if file_info then
       if file_info.zone and not netjson_interface.zone then
@@ -397,15 +387,16 @@ for _, name in ipairs(ifs) do
       end
     end
 
-
     if b.type == "bridge" then
       local members = bridge_members(name)
-      if members then netjson_interface.bridge_members = members end
+      if members then
+        for i,m in ipairs(members) do members[i] = map_iface_name_to_eth(m) end
+        netjson_interface.bridge_members = members
+      end
     end
 
-    -- Wireless enrichment (guarded via iwinfo/hostapd ubus)
     if b.type == "wireless" then
-      local iw = iwinfo_via_ubus(name)
+      local iw --= iwinfo_via_ubus(name)
       if iw then
         netjson_interface.wireless = {
           ssid      = iw.ssid,
@@ -425,20 +416,16 @@ for _, name in ipairs(ifs) do
           clients = hostapd_clients(name) or iwinfo_assoclist(name)
         end
         if clients and not monitoring.utils.is_table_empty(clients) then
-          netjson_interface.wireless.clients =
-            monitoring.wifi.netjson_clients(clients, is_mesh)
+          netjson_interface.wireless.clients = monitoring.wifi.netjson_clients(clients, is_mesh)
         end
       end
     elseif vpn_interfaces[name] then
-      -- keep "virtual" type label but we already filtered known-bad names
       netjson_interface.type = "virtual"
     end
 
-    -- Statistics (from /proc/net/dev) — produce flat-key statistics
     if monitor_all or include_stats[name] then
       local st = counters[name]
       if st then
-        -- decide source values; we may need to swap rx<->tx first for wifi
         local rx_bytes = st.rx_bytes
         local rx_packets = st.rx_packets
         local rx_errors = st.rx_errors
@@ -450,14 +437,12 @@ for _, name in ipairs(ifs) do
         local tx_dropped = st.tx_dropped
 
         if monitoring.wifi.needs_inversion(netjson_interface) then
-          -- swap rx <-> tx
           rx_bytes, tx_bytes = tx_bytes, rx_bytes
           rx_packets, tx_packets = tx_packets, rx_packets
           rx_errors, tx_errors = tx_errors, rx_errors
           rx_dropped, tx_dropped = tx_dropped, rx_dropped
         end
 
-        -- build flat statistics object, only including keys that are non-nil
         local stats = {}
         if rx_bytes    ~= nil then stats.rx_bytes    = rx_bytes    end
         if rx_packets  ~= nil then stats.rx_packets  = rx_packets  end
@@ -473,13 +458,11 @@ for _, name in ipairs(ifs) do
       end
     end
 
-    -- IP addresses (already normalized to ipv4/ipv6)
     local addrs = addr_map[name]
     if addrs and next(addrs) then
       netjson_interface.addresses = addrs
     end
 
-    -- Specialized interface info (guarded)
     local info = safe_get_interface_info(name, netjson_interface)
     if info.stp ~= nil then netjson_interface.stp = info.stp end
     if type(info.specialized) == "table" then
@@ -496,52 +479,75 @@ for _, name in ipairs(ifs) do
   end
 end
 
--- NEW: map mobile JSON -> interface entry and append
-local function mobile_to_interface(mobj, idx)
-  -- mobj is the value of decoded_json.mobile
+----------------------------------------------------------------
+-- NEW: attach mobile JSON files safely (mobile1 -> modem, mobile2 -> modem2)
+----------------------------------------------------------------
+local function read_kv_file(path)
+  local t = {}
+  local fh, err = io.open(path, "r")
+  if not fh then
+    return nil, ("failed to open %s: %s"):format(path, tostring(err))
+  end
+  for line in fh:lines() do
+    local k, v = line:match("^%s*(.-)%s*:%s*(.*)$")
+    if k then t[k] = v end
+  end
+  fh:close()
+  return t
+end
+
+local function find_host_iface_by_name(name)
+  for _, iface in ipairs(host_interfaces) do
+    if iface.name == name then return iface end
+  end
+  return nil
+end
+
+local function mobile_obj_to_mobile_table(mobj)
   if type(mobj) ~= "table" then return nil end
-
-  local parse_name = (idx == 1) and "modem" or "modem2"
-
-  local iface = {
-    name = parse_name,
-    type = "mobile",
-    up   = (mobj.connection_status == "connected")
-  }
-  -- keep everything under a namespaced key to avoid clashing with common iface keys
-  iface.mobile = {
+  return {
     imei              = mobj.imei,
     operator_code     = mobj.operator_code,
     operator_name     = mobj.operator_name,
     connection_status = mobj.connection_status,
-    power_status  = mobj.power_status,
+    power_status      = mobj.power_status,
     manufacturer      = mobj.manufacturer,
     model             = mobj.model,
     signal            = mobj.signal
   }
-  return iface
 end
 
-do
-  local j1 = read_json_file("/tmp/mobile1.json")
-  if j1 and type(j1.mobile) == "table" then
-    local i1 = mobile_to_interface(j1.mobile, 1)
-    if i1 then table.insert(host_interfaces, i1) end
+local function attach_mobile_file_to_iface(json_path, ifname)
+  local parsed, perr = read_json_file(json_path)
+  if not parsed then return false, ("no json at %s: %s"):format(json_path, tostring(perr)) end
+  local mtable = mobile_obj_to_mobile_table(parsed.mobile or parsed)
+  if not mtable then return false, "mobile table missing or invalid" end
+  local existing = find_host_iface_by_name(ifname)
+  if existing then
+    existing.mobile = existing.mobile or {}
+    for k,v in pairs(mtable) do existing.mobile[k] = v end
+    if mtable.connection_status then existing.up = (mtable.connection_status == "connected") end
+  else
+    local new_iface = {
+      name = ifname,
+      type = "mobile",
+      up   = (mtable.connection_status == "connected"),
+      mobile = mtable
+    }
+    table.insert(host_interfaces, new_iface)
   end
-  local j2 = read_json_file("/tmp/mobile2.json")
-  if j2 and type(j2.mobile) == "table" then
-    local i2 = mobile_to_interface(j2.mobile, 2)
-    if i2 then table.insert(host_interfaces, i2) end
-  end
+  return true
 end
 
+attach_mobile_file_to_iface("/tmp/mobile1.json", "modem")
+attach_mobile_file_to_iface("/tmp/mobile2.json", "modem2")
 
--- === Attach ping measurements from /tmp/ping_results.json to matching interfaces ===
-
+----------------------------------------------------------------
+-- Attach ping measurements from /tmp/ping_metrics.json to matching interfaces
+----------------------------------------------------------------
 local function iface_matches_srcip(iface, srcip)
   if not srcip then return false end
   if not iface.addresses then return false end
-
   for _, a in pairs(iface.addresses) do
     if type(a) == "string" then
       if a == srcip then return true end
@@ -556,30 +562,24 @@ local function iface_matches_srcip(iface, srcip)
 end
 
 local function find_host_interface(name, srcip)
+  local mapped_name = name and map_iface_name_to_eth(name) or nil
   for _, iface in ipairs(host_interfaces) do
-    if name and iface.name == name then return iface end
+    if name and (iface.name == name or iface.name == mapped_name) then return iface end
     if srcip and iface_matches_srcip(iface, srcip) then return iface end
   end
   return nil
 end
 
--- scan record for any throughput* keys and normalize into a throughput table
 local function extract_throughput_from_record(rec)
   if type(rec) ~= "table" then return nil end
   local thr = {}
   local any = false
   for k, v in pairs(rec) do
     if type(k) == "string" and k:match("^throughput") then
-      -- normalize key names: e.g. throughput_rx_bytes_per_s -> rx_bytes_per_s
       local nk = k:gsub("^throughput_", "")
-      -- coerce numeric strings to numbers (preserve numbers as-is)
       if type(v) == "string" then
         local n = tonumber(v)
-        if n ~= nil then
-          thr[nk] = n
-        else
-          thr[nk] = v
-        end
+        if n ~= nil then thr[nk] = n else thr[nk] = v end
       else
         thr[nk] = v
       end
@@ -591,31 +591,31 @@ local function extract_throughput_from_record(rec)
 end
 
 do
-  local ping_file = "/tmp/ping_results.json"
-  local pings = read_json_file(ping_file)
+  local ping_file = "/tmp/ping_metrics.json"
+  local pings, perr = read_json_file(ping_file)
   if pings and type(pings) == "table" then
     for _, rec in ipairs(pings) do
-      local ifname = rec["interface"] or rec.interface
-      local srcip  = rec["src ip"] or rec["src_ip"] or rec.src_ip or rec["src"] or rec.src
+      local ifname = rec["device_name"] or rec.device_name or rec["interface"] or rec.interface
+      local srcip  = rec["source_ip"]   or rec.source_ip   or rec["src ip"] or rec["src_ip"] or rec.src_ip or rec["src"] or rec.src
 
       local target_iface = find_host_interface(ifname, srcip)
       if target_iface then
+  local dest_ip = rec["destination_ip"] or rec.destination_ip
+                        or rec["destination"] or rec.destination 
+      or rec["dest ip"] or rec.dest_ip or rec.dest
+        local pkt_loss = rec.packet_loss or rec.packet_loss_percent or rec.loss
+        if type(pkt_loss) == "number" then pkt_loss = tostring(pkt_loss) .. "%" end
+
         local ping_obj = {
-          dest_ip     = rec["dest ip"] or rec.dest_ip or rec.dest,
+          dest_ip     = dest_ip,
           timestamp   = rec.timestamp,
           latency_ms  = (rec.latency_ms ~= nil) and tonumber(rec.latency_ms) or rec.latency_ms,
           jitter_ms   = (rec.jitter_ms  ~= nil) and tonumber(rec.jitter_ms)  or rec.jitter_ms,
-          packet_loss = rec.packet_loss or rec.packet_loss_percent or rec.loss
+          packet_loss = pkt_loss
         }
 
         local thr = extract_throughput_from_record(rec)
-        if thr then
-          ping_obj.throughput = thr
-        else
-          -- if you prefer to keep an empty table instead of `nil` when throughput absent,
-          -- uncomment the next line:
-          -- ping_obj.throughput = {}
-        end
+        if thr then ping_obj.throughput = thr end
 
         target_iface.ping = ping_obj
       else
@@ -625,10 +625,8 @@ do
     end
   end
 end
--- === end ping block ===
 
-
--- System-level DNS (fast path)
+-- System-level DNS
 local sys_dns_servers, sys_dns_search = read_dns()
 for _, v in ipairs(sys_dns_servers or {}) do table.insert(dns_servers, v) end
 for _, v in ipairs(sys_dns_search or {}) do table.insert(dns_search, v) end
@@ -642,34 +640,12 @@ if next(host_interfaces) ~= nil then netjson.interfaces = host_interfaces end
 if next(dns_servers)   ~= nil then netjson.dns_servers = dns_servers end
 if next(dns_search)    ~= nil then netjson.dns_search  = dns_search  end
 
-
 ----------------------------------------------------------------
--- Below data is of MODEM1 and MODEM2 
+-- Legacy KV readers for modem etc.
 ----------------------------------------------------------------
--- Read all key:value pairs from a file into a table (raw strings)
-local function read_kv_file(path)
-  local t = {}
-  local fh, err = io.open(path, "r")
-  if not fh then
-    return nil, ("failed to open %s: %s"):format(path, tostring(err))
-  end
-
-  for line in fh:lines() do
-    -- capture any key (including spaces) up to the first colon, trim surrounding whitespace
-    local k, v = line:match("^%s*(.-)%s*:%s*(.*)$")
-    if k then
-      -- keep exactly as read (may be empty string)
-      t[k] = v
-    end
-  end
-
-  fh:close()
-  return t
-end
-
 netjson.cellular = {
-  modem = read_kv_file("/tmp/modem_data.info"),
-  modem2 = read_kv_file("/tmp/modem_data2.info")
+  modem = (read_kv_file("/tmp/modem_data.info")),
+  modem2 = (read_kv_file("/tmp/modem_data2.info"))
 }
 
 netjson.wlan = {
@@ -688,10 +664,6 @@ netjson.ethernet = {
   eth5_data = read_kv_file("/tmp/eth5.info")
 }
 
-netjson.dpi = {
-  data = read_kv_file("/tmp/dpi.info")
-}
-
 netjson.performance_sla = {
   data = read_kv_file("/tmp/performance_sla.info")
 }
@@ -700,7 +672,39 @@ netjson.zone_firewall = {
   data = read_kv_file("/tmp/zone_firewall.info")
 }
 
-io.write(cjson.encode(netjson))
-return cjson.encode(netjson)
+-- Collect Real Time Monitor Data.
+local dpi_summary_client = "/tmp/monitoring_agent/realtime_monitor/dpi_summary_by_client.json"
+local python_status = os.execute("/usr/bin/python3 /usr/sbin/collect_dpi_client_data.py >/dev/null 2>&1")
+local dpiclient_data = {}
+if python_status == 0 then
+  local file = io.open(dpi_summary_client, "r")
+  if file then
+    local content = file:read("*a")
+    file:close()
+    os.remove(dpi_summary_client)
+    local ok, decoded = pcall(cjson.decode, content)
+    if ok then dpiclient_data = decoded else dpiclient_data = {} end
+  else
+    dpiclient_data = {}
+  end
+else
+  dpiclient_data = {}
+end
+
+local traffic_data, terr = read_json_file("/tmp/traffic.info")
+if not traffic_data then traffic_data = {} end
+
+netjson.realtimemonitor = {
+  traffic = { dpi_client_data = dpiclient_data },
+  real_time_traffic = { data = traffic_data }
+}
+
+-- final output
+local ok, out = pcall(cjson.encode, netjson)
+if not ok then
+  io.stderr:write("error encoding output JSON: "..tostring(out).."\n")
+  os.exit(1)
+end
+io.write(out)
 
 
