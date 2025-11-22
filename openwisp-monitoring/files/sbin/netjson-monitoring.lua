@@ -600,9 +600,7 @@ do
 
       local target_iface = find_host_interface(ifname, srcip)
       if target_iface then
-  local dest_ip = rec["destination_ip"] or rec.destination_ip
-                        or rec["destination"] or rec.destination 
-      or rec["dest ip"] or rec.dest_ip or rec.dest
+  local dest_ip = rec["destination_ip"] or rec.destination_ip or rec["destination"] or rec.destination or rec["dest ip"] or rec.dest_ip or rec.dest
         local pkt_loss = rec.packet_loss or rec.packet_loss_percent or rec.loss
         if type(pkt_loss) == "number" then pkt_loss = tostring(pkt_loss) .. "%" end
 
@@ -691,7 +689,7 @@ else
   dpiclient_data = {}
 end
 
-local traffic_data, terr = read_json_file("/tmp/traffic.info")
+local traffic_data, terr = read_json_file("/tmp/top_traffic.info")
 if not traffic_data then traffic_data = {} end
 
 netjson.realtimemonitor = {
