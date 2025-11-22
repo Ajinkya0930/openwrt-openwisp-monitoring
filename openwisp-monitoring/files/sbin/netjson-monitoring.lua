@@ -116,6 +116,7 @@ for _, radio in pairs(wireless_status) do
   end
 end
 
+--------------------- new patch for interfaces ---------------------------------------
 -- collect interface stats
 for name, interface in pairs(network_status) do
   if not monitoring.utils.is_excluded(name) then
@@ -180,6 +181,72 @@ for name, interface in pairs(network_status) do
     end
   end
 end
+
+-- >>> WAN ANNOTATION START
+-- build lookups for list-wans (by iface and by device)
+local wan_by_iface = {}
+local wan_by_device = {}
+
+do
+  local ok, wan_resp = pcall(function()
+    return ubus:call('ns.dashboard', 'list-wans', {})
+  end)
+  if ok and wan_resp and wan_resp.result then
+    for _, w in ipairs(wan_resp.result) do
+      if w.iface then wan_by_iface[w.iface] = w end
+      if w.device then wan_by_device[w.device] = w end
+    end
+  end
+end
+
+-- build name -> kernel device map using network_status (if available)
+local name_to_device = {}
+for k, v in pairs(network_status or {}) do
+  if v.device then name_to_device[k] = v.device end
+  if v.ifname then name_to_device[k] = v.ifname end
+end
+
+-- helper: try to match wan for an interface entry
+local function match_wan_for_interface(intf)
+  -- 1) direct iface name match (list-wans.iface)
+  if wan_by_iface[intf.name] then
+    return wan_by_iface[intf.name]
+  end
+
+  -- 2) direct device name match using interface.name (sometimes list-wans.device == "eth1" and intf.name == "eth1")
+  if wan_by_device[intf.name] then
+    return wan_by_device[intf.name]
+  end
+
+  -- 3) use name_to_device mapping from original network_status
+  local dev = name_to_device[intf.name]
+  if dev and wan_by_device[dev] then
+    return wan_by_device[dev]
+  end
+
+  -- 4) if interface is a bridge, check its bridge_members for a device match
+  if intf.bridge_members and type(intf.bridge_members) == "table" then
+    for _, member in ipairs(intf.bridge_members) do
+      local member_dev = name_to_device[member] or member
+      if member_dev and wan_by_device[member_dev] then
+        return wan_by_device[member_dev]
+      end
+    end
+  end
+
+  return nil
+end
+
+-- annotate host_interfaces
+for _, intf in ipairs(host_interfaces) do
+  local matched = match_wan_for_interface(intf)
+  if matched then
+    intf.role = "wan"
+    intf.is_wan = true
+    intf.wan_info = { iface = matched.iface, device = matched.device }
+  end
+end
+-- <<< WAN ANNOTATION END
 
 if next(host_interfaces) ~= nil then netjson.interfaces = host_interfaces end
 if next(dns_servers) ~= nil then netjson.dns_servers = dns_servers end
@@ -486,6 +553,5 @@ netjson.realtimemonitor = {
 
 io.write(cjson.encode(netjson))
 return cjson.encode(netjson)
-
 
 
