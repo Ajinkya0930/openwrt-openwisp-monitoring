@@ -1,5 +1,5 @@
 #!/usr/bin/env lua
--- sample_netjson.lua  (fixed unmatched 'end' issue)
+-- sample_netjson.lua  (updated: only include modem/modem2 if /sys/class/net/<name> exists)
 package.path = package.path .. ";../files/lib/?.lua"
 
 local cjson = require('cjson')
@@ -70,8 +70,7 @@ local function safe_get_interface_info(name, iface_tbl)
 end
 
 ----------------------------------------------------------------
--- Single robust JSON reader used everywhere
--- returns table or nil,err
+-- JSON reader
 ----------------------------------------------------------------
 local function read_json_file(path)
   if type(path) ~= "string" then return nil, "path must be string" end
@@ -123,12 +122,99 @@ local function is_bad_iface_name(name)
   return false
 end
 
+----------------------------------------------------------------
+-- Map interface names -> canonical ethN where appropriate
+-- Handles: eth-1, eth_1, eth01, lan1, Lan1 -> eth1
+----------------------------------------------------------------
 local function map_iface_name_to_eth(name)
   if not name then return name end
-  local n = name:match("^lan(%d+)$")
-  if n then return "eth" .. n end
-  if name == "inter-lan" then return "eth0" end
-  return name
+  local nm = name:lower()
+  local ethdash = nm:match("^eth%-0*(%d+)$") or nm:match("^eth%-([0-9]+)$")
+  if ethdash then return "eth" .. tonumber(ethdash) end
+  local eth_ = nm:match("^eth_0*(%d+)$") or nm:match("^eth_([0-9]+)$")
+  if eth_ then return "eth" .. tonumber(eth_) end
+  local ethplain = nm:match("^eth0*(%d+)$")
+  if ethplain then return "eth" .. tonumber(ethplain) end
+  local lan = nm:match("^lan0*(%d+)$") or nm:match("^lan([0-9]+)$")
+  if lan then return "eth" .. tonumber(lan) end
+  if nm == "inter-lan" then return "eth0" end
+  return nm
+end
+
+----------------------------------------------------------------
+-- Merge helpers: merge new iface data into existing to avoid duplicates
+----------------------------------------------------------------
+local function merge_tables(dest, src)
+  for k, v in pairs(src) do
+    if dest[k] == nil then
+      dest[k] = v
+    else
+      if type(dest[k]) == "table" and type(v) == "table" then
+        local function is_array(t)
+          local n = 0
+          for kk in pairs(t) do
+            if type(kk) == "number" then n = n + 1 end
+          end
+          return n > 0
+        end
+        local dest_arr = is_array(dest[k])
+        local v_arr = is_array(v)
+        if dest_arr and v_arr then
+          local seen = {}
+          for _, item in ipairs(dest[k]) do seen[tostring(item)] = true end
+          for _, item in ipairs(v) do
+            if not seen[tostring(item)] then table.insert(dest[k], item); seen[tostring(item)] = true end
+          end
+        else
+          for kk, vv in pairs(v) do
+            if dest[k][kk] == nil then dest[k][kk] = vv end
+          end
+        end
+      else
+        -- keep dest's scalar value (safer)
+      end
+    end
+  end
+end
+
+local function merge_iface_into_list(iface_tbl, list)
+  local name = iface_tbl.name
+  if not name then
+    table.insert(list, iface_tbl)
+    return iface_tbl
+  end
+
+  local mapped_name = map_iface_name_to_eth(name)
+
+  for _, existing in ipairs(list) do
+    local existing_mapped = map_iface_name_to_eth(existing.name or existing)
+    if existing.name == name or existing.name == mapped_name or existing_mapped == mapped_name then
+      merge_tables(existing, iface_tbl)
+      return existing
+    end
+  end
+
+  iface_tbl.name = mapped_name
+  table.insert(list, iface_tbl)
+  return iface_tbl
+end
+
+----------------------------------------------------------------
+-- Interface existence / operstate helpers
+----------------------------------------------------------------
+local function iface_is_present(ifname)
+  if not ifname then return false end
+  return file_exists("/sys/class/net/" .. ifname)
+end
+
+local function sys_iface_operstate(ifname)
+  if not ifname then return nil end
+  if not iface_is_present(ifname) then return nil end
+  local path = "/sys/class/net/" .. ifname .. "/operstate"
+  local f = io.open(path)
+  if not f then return nil end
+  local s = f:read("*l"); f:close()
+  return s and s:match("^%s*(.-)%s*$") or nil
 end
 
 ----------------------------------------------------------------
@@ -257,27 +343,49 @@ local function read_dns()
 end
 
 ----------------------------------------------------------------
--- read the eth interfaces file
+-- read the eth interfaces file (zone, mode)
 ----------------------------------------------------------------
+-- read the eth interfaces file (zone, mode)
 local function read_iface_zone_mode(name)
-  local path = "/tmp/" .. name .. ".info"
-  local f = io.open(path, "r")
-  if not f then return nil end
-  local zone, mode
-  for line in f:lines() do
-    line = line:match("^%s*(.-)%s*$")
-    if line ~= "" then
-      local k, v = line:match("^(%S+)%s*:%s*(.-)%s*$")
-      if k and v then
-        k = k:lower()
-        if k == "zone" then zone = v end
-        if k == "mode" then mode = v end
+  if not name then return nil end
+
+  local function parse_file(path)
+    local f = io.open(path, "r")
+    if not f then return nil end
+    local zone, mode
+    for line in f:lines() do
+      line = line:match("^%s*(.-)%s*$")
+      if line ~= "" then
+        local k, v = line:match("^(%S+)%s*:%s*(.-)%s*$")
+        if k and v then
+          k = k:lower()
+          if k == "zone" then zone = v end
+          if k == "mode" then mode = v end
+        end
       end
     end
+    f:close()
+    if zone == nil and mode == nil then return nil end
+    return { zone = zone, mode = mode }
   end
-  f:close()
-  return { zone = zone, mode = mode }
+
+  -- check exact name first
+  local p1 = "/tmp/" .. name .. ".info"
+  local res = parse_file(p1)
+  if res then return res end
+
+  -- if not found, try canonical mapped name (eth-1 -> eth1, lan1 -> eth1)
+  local mapped = map_iface_name_to_eth(name)
+  if mapped and mapped ~= name then
+    local p2 = "/tmp/" .. mapped .. ".info"
+    res = parse_file(p2)
+    if res then return res end
+  end
+
+  return nil
 end
+
+
 
 ----------------------------------------------------------------
 -- Collect system info (fast ubus)
@@ -300,6 +408,7 @@ if file_exists("/tmp/device.info") then
   local s = read_all("/tmp/device.info") or ""
   serial_num = s:match("devsn%s*[:=]%s*(%S+)") or ""
 end
+
 ----------------------------------------------------------------
 -- Init NetJSON
 ----------------------------------------------------------------
@@ -374,18 +483,20 @@ for _, name in ipairs(ifs) do
     }
     if mac then netjson_interface.mac = mac end
 
-    local file_info = read_iface_zone_mode(name)
-    if file_info then
-      if file_info.zone and not netjson_interface.zone then
-        netjson_interface.role = string.lower(file_info.zone)
-      end
+  local file_info = read_iface_zone_mode(name)
+if file_info then
+  if file_info.zone and not netjson_interface.zone then
+    netjson_interface.role = string.lower(file_info.zone)
+  end
 
-      local zone_l = file_info.zone and string.lower(file_info.zone) or nil
-      local mode_l = file_info.mode and string.lower(file_info.mode) or nil
-      if (zone_l == "wan" or (mode_l and mode_l:match("^wan"))) and not netjson_interface.is_wan then
-        netjson_interface.is_wan = true
-      end
-    end
+  local zone_l = file_info.zone and string.lower(file_info.zone) or nil
+  local mode_l = file_info.mode and string.lower(file_info.mode) or nil
+  if (zone_l == "wan" or (mode_l and mode_l:match("^wan"))) and not netjson_interface.is_wan then
+    netjson_interface.is_wan = true
+  end
+end
+
+
 
     if b.type == "bridge" then
       local members = bridge_members(name)
@@ -423,8 +534,9 @@ for _, name in ipairs(ifs) do
       netjson_interface.type = "virtual"
     end
 
-    if monitor_all or include_stats[name] then
-      local st = counters[name]
+    -- statistics: take counters by original sys name, but attach to canonical mapped interface
+    if monitor_all or include_stats[name] or include_stats[mapped_name] then
+      local st = counters[name] or counters[mapped_name]
       if st then
         local rx_bytes = st.rx_bytes
         local rx_packets = st.rx_packets
@@ -458,7 +570,8 @@ for _, name in ipairs(ifs) do
       end
     end
 
-    local addrs = addr_map[name]
+    -- addresses: prefer addr_map[original] or addr_map[mapped]
+    local addrs = addr_map[name] or addr_map[mapped_name]
     if addrs and next(addrs) then
       netjson_interface.addresses = addrs
     end
@@ -475,12 +588,13 @@ for _, name in ipairs(ifs) do
       monitoring.utils.array_concat(info.dns_search, dns_search)
     end
 
-    table.insert(host_interfaces, netjson_interface)
+    -- MERGE into host_interfaces (this prevents eth-1 + eth1 duplicates)
+    merge_iface_into_list(netjson_interface, host_interfaces)
   end
 end
 
 ----------------------------------------------------------------
--- NEW: attach mobile JSON files safely (mobile1 -> modem, mobile2 -> modem2)
+-- NEW: attach mobile JSON files safely (only if kernel exposes the interface)
 ----------------------------------------------------------------
 local function read_kv_file(path)
   local t = {}
@@ -497,8 +611,13 @@ local function read_kv_file(path)
 end
 
 local function find_host_iface_by_name(name)
+  if not name then return nil end
+  local mapped = map_iface_name_to_eth(name)
   for _, iface in ipairs(host_interfaces) do
-    if iface.name == name then return iface end
+    local existing_mapped = map_iface_name_to_eth(iface.name or iface)
+    if iface.name == name or iface.name == mapped or existing_mapped == mapped then
+      return iface
+    end
   end
   return nil
 end
@@ -522,31 +641,63 @@ local function attach_mobile_file_to_iface(json_path, ifname)
   if not parsed then return false, ("no json at %s: %s"):format(json_path, tostring(perr)) end
   local mtable = mobile_obj_to_mobile_table(parsed.mobile or parsed)
   if not mtable then return false, "mobile table missing or invalid" end
+
+  -- only act if kernel exposes the interface
+  if not iface_is_present(ifname) and not iface_is_present(map_iface_name_to_eth(ifname)) then
+    -- do not create any entry or set up flags for non-existing kernel interface
+    -- keep orphan mobile info elsewhere if you want:
+    monitoring._orphan_modems = monitoring._orphan_modems or {}
+    table.insert(monitoring._orphan_modems, { name = ifname, mobile = mtable })
+    return true
+  end
+
   local existing = find_host_iface_by_name(ifname)
+  local kernel_exists = iface_is_present(ifname) or iface_is_present(map_iface_name_to_eth(ifname))
+  local mapped_name = map_iface_name_to_eth(ifname)
+
+  -- prefer kernel operstate if present
+  local oper = sys_iface_operstate(ifname) or sys_iface_operstate(mapped_name)
+  local desired_up = false
+  if oper == "up" then
+    desired_up = true
+  else
+    if mtable.connection_status == "connected" and (not mtable.power_status or mtable.power_status ~= "off") and kernel_exists then
+      desired_up = true
+    else
+      desired_up = false
+    end
+  end
+
   if existing then
     existing.mobile = existing.mobile or {}
     for k,v in pairs(mtable) do existing.mobile[k] = v end
-    if mtable.connection_status then existing.up = (mtable.connection_status == "connected") end
+    existing.up = desired_up
   else
     local new_iface = {
-      name = ifname,
+      name = mapped_name,
       type = "mobile",
-      up   = (mtable.connection_status == "connected"),
+      up   = desired_up,
       mobile = mtable
     }
-    table.insert(host_interfaces, new_iface)
+    merge_iface_into_list(new_iface, host_interfaces)
   end
   return true
 end
 
+-- attach only when kernel interface exists
 attach_mobile_file_to_iface("/tmp/mobile1.json", "modem")
 attach_mobile_file_to_iface("/tmp/mobile2.json", "modem2")
 
-----------------------------------------------------------------
+
 -- Attach ping measurements from /tmp/ping_metrics.json to matching interfaces
-----------------------------------------------------------------
+local function normalize_ping_ifname(raw)
+  if not raw then return nil end
+  return map_iface_name_to_eth(tostring(raw))
+end
+
+-- helper: check if a ping srcip matches an iface.addresses
 local function iface_matches_srcip(iface, srcip)
-  if not srcip then return false end
+  if not srcip or not iface then return false end
   if not iface.addresses then return false end
   for _, a in pairs(iface.addresses) do
     if type(a) == "string" then
@@ -561,46 +712,64 @@ local function iface_matches_srcip(iface, srcip)
   return false
 end
 
+-- find interface by name (canonicalized) or by source IP
 local function find_host_interface(name, srcip)
   local mapped_name = name and map_iface_name_to_eth(name) or nil
   for _, iface in ipairs(host_interfaces) do
-    if name and (iface.name == name or iface.name == mapped_name) then return iface end
-    if srcip and iface_matches_srcip(iface, srcip) then return iface end
+    -- match by passed name or canonicalized name
+    if name and (iface.name == name or iface.name == mapped_name) then
+      return iface
+    end
+    -- match by source ip if provided
+    if srcip and iface_matches_srcip(iface, srcip) then
+      return iface
+    end
   end
   return nil
 end
 
+-- Extract throughput { tx_bytes = ..., rx_bytes = ... } from a ping record
 local function extract_throughput_from_record(rec)
-  if type(rec) ~= "table" then return nil end
-  local thr = {}
-  local any = false
-  for k, v in pairs(rec) do
-    if type(k) == "string" and k:match("^throughput") then
-      local nk = k:gsub("^throughput_", "")
-      if type(v) == "string" then
-        local n = tonumber(v)
-        if n ~= nil then thr[nk] = n else thr[nk] = v end
-      else
-        thr[nk] = v
-      end
-      any = true
-    end
+  if not rec then return nil end
+
+  -- accept multiple naming styles
+  local tx = rec.throughput_tx_bytes or rec.tx_bytes or rec.tx or rec["tx-bytes"]
+  local rx = rec.throughput_rx_bytes or rec.rx_bytes or rec.rx or rec["rx-bytes"]
+
+  if tx or rx then
+    return {
+      tx_bytes = tonumber(tx) or 0,
+      rx_bytes = tonumber(rx) or 0
+    }
   end
-  if any then return thr end
+
   return nil
 end
+
+
 
 do
   local ping_file = "/tmp/ping_metrics.json"
   local pings, perr = read_json_file(ping_file)
-  if pings and type(pings) == "table" then
+  if not pings or type(pings) ~= "table" then
+    -- nothing to do
+  else
     for _, rec in ipairs(pings) do
-      local ifname = rec["device_name"] or rec.device_name or rec["interface"] or rec.interface
-      local srcip  = rec["source_ip"]   or rec.source_ip   or rec["src ip"] or rec["src_ip"] or rec.src_ip or rec["src"] or rec.src
+      local raw_ifname = rec["device_name"] or rec.device_name or rec["interface"] or rec.interface
+      local srcip = rec["source_ip"]   or rec.source_ip   or rec["src ip"] or rec["src_ip"] or rec.src_ip or rec["src"] or rec.src
 
-      local target_iface = find_host_interface(ifname, srcip)
+      local canonical_ifname = normalize_ping_ifname(raw_ifname)
+
+      local target_iface = nil
+      if canonical_ifname then
+        target_iface = find_host_interface(canonical_ifname, nil)
+      end
+      if not target_iface and srcip then
+        target_iface = find_host_interface(nil, srcip)
+      end
+
       if target_iface then
-  local dest_ip = rec["destination_ip"] or rec.destination_ip or rec["destination"] or rec.destination or rec["dest ip"] or rec.dest_ip or rec.dest
+        local dest_ip = rec["destination_ip"] or rec.destination_ip or rec["destination"] or rec.destination or rec["dest ip"] or rec.dest_ip or rec.dest
         local pkt_loss = rec.packet_loss or rec.packet_loss_percent or rec.loss
         if type(pkt_loss) == "number" then pkt_loss = tostring(pkt_loss) .. "%" end
 
@@ -617,14 +786,18 @@ do
 
         target_iface.ping = ping_obj
       else
-        if not monitoring._orphan_pings then monitoring._orphan_pings = {} end
+        monitoring._orphan_pings = monitoring._orphan_pings or {}
         table.insert(monitoring._orphan_pings, rec)
       end
     end
   end
 end
 
+
+
+----------------------------------------------------------------
 -- System-level DNS
+----------------------------------------------------------------
 local sys_dns_servers, sys_dns_search = read_dns()
 for _, v in ipairs(sys_dns_servers or {}) do table.insert(dns_servers, v) end
 for _, v in ipairs(sys_dns_search or {}) do table.insert(dns_search, v) end
@@ -639,20 +812,29 @@ if next(dns_servers)   ~= nil then netjson.dns_servers = dns_servers end
 if next(dns_search)    ~= nil then netjson.dns_search  = dns_search  end
 
 ----------------------------------------------------------------
--- Legacy KV readers for modem etc.
+-- Legacy KV readers for modem etc.  (only include if kernel interface exists)
 ----------------------------------------------------------------
-netjson.cellular = {
-  modem = (read_kv_file("/tmp/modem_data.info")),
-  modem2 = (read_kv_file("/tmp/modem_data2.info"))
-}
+local cellular_modem, cellular_modem2 = nil, nil
+if iface_is_present("modem") or iface_is_present(map_iface_name_to_eth("modem")) then
+  cellular_modem = read_kv_file("/tmp/modem_data.info")
+end
+if iface_is_present("modem2") or iface_is_present(map_iface_name_to_eth("modem2")) then
+  cellular_modem2 = read_kv_file("/tmp/modem_data2.info")
+end
 
-netjson.wlan = {
-  wlan_data = read_kv_file("/tmp/wlan.info")
-}
+if cellular_modem or cellular_modem2 then
+  netjson.cellular = {}
+  if cellular_modem then netjson.cellular.modem = cellular_modem end
+  if cellular_modem2 then netjson.cellular.modem2 = cellular_modem2 end
+end
 
-netjson.device = {
-  device_info = read_kv_file("/tmp/device.info")
-}
+netjson.wlan = {}
+local wlan_kv = read_kv_file("/tmp/wlan.info")
+if wlan_kv then netjson.wlan.wlan_data = wlan_kv end
+
+netjson.device = {}
+local device_kv = read_kv_file("/tmp/device.info")
+if device_kv then netjson.device.device_info = device_kv end
 
 netjson.ethernet = {
   eth1_data = read_kv_file("/tmp/eth1.info"),
@@ -704,5 +886,4 @@ if not ok then
   os.exit(1)
 end
 io.write(out)
-
 
