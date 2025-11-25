@@ -404,8 +404,9 @@ load_average = {
 }
 
 local serial_num = ""
-if file_exists("/tmp/device.info") then
-  local s = read_all("/tmp/device.info") or ""
+local f = io.open("/tmp/device_data.info","r")
+if f then
+  local s = f:read("*a"); f:close()
   serial_num = s:match("devsn%s*[:=]%s*(%S+)") or ""
 end
 
