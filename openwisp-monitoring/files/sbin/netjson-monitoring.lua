@@ -207,15 +207,49 @@ local function iface_is_present(ifname)
   return file_exists("/sys/class/net/" .. ifname)
 end
 
+-- robust: read operstate preferring lanN for any ethN canonical name
 local function sys_iface_operstate(ifname)
   if not ifname then return nil end
-  if not iface_is_present(ifname) then return nil end
-  local path = "/sys/class/net/" .. ifname .. "/operstate"
-  local f = io.open(path)
-  if not f then return nil end
-  local s = f:read("*l"); f:close()
-  return s and s:match("^%s*(.-)%s*$") or nil
+
+  local function read_oper(ifn)
+    if not ifn then return nil end
+    local path = "/sys/class/net/" .. ifn .. "/operstate"
+    local f = io.open(path, "r")
+    if not f then return nil end
+    local s = f:read("*l")
+    f:close()
+    return s and s:match("^%s*(.-)%s*$") or nil
+  end
+
+  -- canonicalize (handles eth-0, eth_0, lan1, eth01, etc.)
+  local canonical = ifname
+  if type(map_iface_name_to_eth) == "function" then
+    canonical = map_iface_name_to_eth(ifname) or canonical
+  end
+
+  -- if canonical is ethN => try lanN first
+  local eth_index = canonical:match("^eth(%d+)$")
+  if eth_index then
+    local s = read_oper("lan" .. eth_index)
+    if s then return s end
+    -- try canonical (ethN) next
+    s = read_oper(canonical)
+    if s then return s end
+  end
+
+  -- try original raw name
+  local s = read_oper(ifname)
+  if s then return s end
+
+  -- try mapped/canonical name (if not already tried)
+  if canonical and canonical ~= ifname then
+    s = read_oper(canonical)
+    if s then return s end
+  end
+
+  return nil
 end
+
 
 ----------------------------------------------------------------
 -- Interface enumeration helpers
@@ -257,26 +291,46 @@ local function read_netdev_counters()
   return map
 end
 
+-- improved iface_basic_info: reads MTU/MAC/speed from the actual kernel iface when present,
+-- and uses sys_iface_operstate() (which prefers lanN for ethN)
 local function iface_basic_info(name)
   local info = {}
-  info.mtu = tonumber(read_first_line("/sys/class/net/"..name.."/mtu"))
-  info.mac = read_first_line("/sys/class/net/"..name.."/address")
-  if file_exists("/sys/class/net/"..name.."/wireless") then
+
+  -- Prefer an existing kernel name: try original, then mapped canonical
+  local actual = name
+  if not iface_is_present(actual) and type(map_iface_name_to_eth) == "function" then
+    local mapped = map_iface_name_to_eth(name)
+    if mapped and iface_is_present(mapped) then actual = mapped end
+  end
+
+  -- read MTU/MAC from the actual (present) interface when possible
+  local mtu_raw = read_first_line("/sys/class/net/"..actual.."/mtu")
+  info.mtu = tonumber(mtu_raw)
+  info.mac = read_first_line("/sys/class/net/"..actual.."/address")
+
+  -- determine type using the actual interface (safer)
+  if file_exists("/sys/class/net/"..actual.."/wireless") then
     info.type = "wireless"
-  elseif file_exists("/sys/class/net/"..name.."/bridge") then
+  elseif file_exists("/sys/class/net/"..actual.."/bridge") then
     info.type = "bridge"
-  elseif file_exists("/sys/class/net/"..name.."/tun_flags") or name:match("^tun") or name:match("^tap") or name:match("^wg") then
+  elseif file_exists("/sys/class/net/"..actual.."/tun_flags") or name:match("^tun") or name:match("^tap") or name:match("^wg") then
     info.type = "virtual"
   elseif name == "modem" or name == "modem2" then
     info.type = "mobile"
   else
     info.type = "ethernet"
   end
-  info.up = (read_first_line("/sys/class/net/"..name.."/operstate") == "up")
-  local speed = read_first_line("/sys/class/net/"..name.."/speed")
+
+  -- use sys_iface_operstate (which prefers lanN for any ethN canonical name)
+  info.up = (sys_iface_operstate(name) == "up")
+
+  -- read speed from actual iface if possible
+  local speed = read_first_line("/sys/class/net/"..actual.."/speed")
   info.speed = speed and speed:gsub("%s+$", "") or nil
+
   return info
 end
+
 
 local function iface_addresses()
   local map = {}
@@ -404,9 +458,8 @@ load_average = {
 }
 
 local serial_num = ""
-local f = io.open("/tmp/device_data.info","r")
-if f then
-  local s = f:read("*a"); f:close()
+if file_exists("/tmp/device.info") then
+  local s = read_all("/tmp/device.info") or ""
   serial_num = s:match("devsn%s*[:=]%s*(%S+)") or ""
 end
 
@@ -484,18 +537,18 @@ for _, name in ipairs(ifs) do
     }
     if mac then netjson_interface.mac = mac end
 
-  local file_info = read_iface_zone_mode(name)
-if file_info then
-  if file_info.zone and not netjson_interface.zone then
-    netjson_interface.role = string.lower(file_info.zone)
-  end
+    local file_info = read_iface_zone_mode(name)
+    if file_info then
+      if file_info.zone and not netjson_interface.zone then
+        netjson_interface.role = string.lower(file_info.zone)
+      end
 
-  local zone_l = file_info.zone and string.lower(file_info.zone) or nil
-  local mode_l = file_info.mode and string.lower(file_info.mode) or nil
-  if (zone_l == "wan" or (mode_l and mode_l:match("^wan"))) and not netjson_interface.is_wan then
-    netjson_interface.is_wan = true
-  end
-end
+      local zone_l = file_info.zone and string.lower(file_info.zone) or nil
+      local mode_l = file_info.mode and string.lower(file_info.mode) or nil
+      if (zone_l == "wan" or (mode_l and mode_l:match("^wan"))) and not netjson_interface.is_wan then
+        netjson_interface.is_wan = true
+      end
+    end
 
 
 
