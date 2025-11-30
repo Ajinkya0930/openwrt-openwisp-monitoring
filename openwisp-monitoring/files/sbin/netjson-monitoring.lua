@@ -332,25 +332,114 @@ local function iface_basic_info(name)
 end
 
 
+-- Lua 5.1 safe: robust iface_addresses + cached get_addresses
+local cached_map = nil
+
 local function iface_addresses()
   local map = {}
-  local out = sh("ip -o addr show")
+  local out = sh("ip -o addr show") or ""
+  if out == "" then return map end
+
   for line in out:gmatch("[^\n]+") do
-    local ifname, fam, addr = line:match("^%d+:%s*([^%s]+)%s+([^%s]+)%s+([^%s]+)")
-    if ifname and fam and addr and (fam == "inet" or fam == "inet6") then
-      local ip, mask = addr:match("^([^/]+)/(%d+)$")
-      ip   = ip or addr
-      mask = tonumber(mask)
-      local family = (fam == "inet") and "ipv4" or "ipv6"
-      if family == "ipv6" then ip = ip:gsub("%%[%w._-]+$", "") end
-      map[ifname] = map[ifname] or {}
-      local entry = { family = family, address = ip }
-      if mask then entry.mask = mask end
-      table.insert(map[ifname], entry)
+    -- tokenize by whitespace
+    local fields = {}
+    for f in line:gmatch("%S+") do table.insert(fields, f) end
+    if #fields == 0 then
+      -- nothing to do for this line
+    else
+      -- find 'inet' or 'inet6'
+      local fam_idx, fam_token = nil, nil
+      for i = 1, #fields do
+        if fields[i] == "inet" or fields[i] == "inet6" then
+          fam_idx = i
+          fam_token = fields[i]
+          break
+        end
+      end
+
+      if fam_idx then
+        local addr_tok = fields[fam_idx + 1]
+        local peer_tok = nil
+
+        -- find peer token if present
+        for i = fam_idx + 1, math.min(#fields, fam_idx + 8) do
+          if fields[i] == "peer" and fields[i + 1] then
+            peer_tok = fields[i + 1]
+            break
+          end
+        end
+
+        if addr_tok == "peer" then addr_tok = fields[fam_idx + 2] end
+
+        -- helper to detect IP-like token
+        local function looks_like_ip_token(s)
+          if not s then return false end
+          if s:match("^%d+%.%d+%.%d+%.%d+/%d+$") then return true end
+          if s:match("^%d+%.%d+%.%d+%.%d+$") then return true end
+          if s:match("^[%x:]+/[%d]+$") then return true end
+          if s:match("^[%x:]+%%[%w._-]+/[%d]+$") then return true end
+          if s:match("^[%x:]+%%[%w._-]+$") then return true end
+          if s:match("^[%x:]+$") then return true end
+          return false
+        end
+
+        if not looks_like_ip_token(addr_tok) then
+          for j = fam_idx + 1, math.min(#fields, fam_idx + 8) do
+            if looks_like_ip_token(fields[j]) then
+              addr_tok = fields[j]
+              break
+            end
+          end
+        end
+
+        if addr_tok then
+          local ip, mask = addr_tok:match("^([^/]+)/(%d+)$")
+          ip = ip or addr_tok
+          mask = tonumber(mask)
+
+          -- try to get mask from peer token (peer x.x.x.x/NN)
+          if not mask and peer_tok then
+            local _, pmask = peer_tok:match("^([^/]+)/(%d+)$")
+            mask = pmask and tonumber(pmask) or nil
+          end
+
+          local family = (fam_token == "inet") and "ipv4" or "ipv6"
+          if family == "ipv6" then ip = ip:gsub("%%[%w._-]+$", "") end
+
+          -- infer p2p mask if still missing and 'peer' present
+          if not mask and line:find("%speer%s") then
+            mask = (family == "ipv4") and 32 or 128
+          end
+
+          -- interface name normally fields[2]
+          local ifname = fields[2] and fields[2]:gsub(":$", "") or nil
+          if ifname and ip then
+            map[ifname] = map[ifname] or {}
+            local entry = { family = family, address = ip }
+            if mask then entry.mask = mask end
+            table.insert(map[ifname], entry)
+          end
+        end
+      end
     end
   end
+
   return map
 end
+
+-- cache builder (call once per collect cycle)
+local function build_address_cache()
+  cached_map = iface_addresses() or {}
+  return cached_map
+end
+
+-- safe accessor: always returns a table (never nil)
+local function get_addresses(name)
+  if not cached_map then build_address_cache() end
+  return cached_map[name] or {}
+end
+
+
 
 local function bridge_members(name)
   local dir = "/sys/class/net/"..name.."/brif"
@@ -521,7 +610,9 @@ local dns_search      = {}
 -- Interfaces
 local ifs       = list_ifaces()
 local counters  = read_netdev_counters()
-local addr_map  = iface_addresses()
+--local addr_map  = iface_addresses()
+build_address_cache()
+
 
 for _, name in ipairs(ifs) do
   if not monitoring.utils.is_excluded(name) then
@@ -626,10 +717,11 @@ for _, name in ipairs(ifs) do
     end
 
     -- addresses: prefer addr_map[original] or addr_map[mapped]
-    local addrs = addr_map[name] or addr_map[mapped_name]
-    if addrs and next(addrs) then
-      netjson_interface.addresses = addrs
-    end
+  -- per-interface (inside loop that builds netjson_interface)
+  local addresses = get_addresses(name)
+  if addresses and next(addresses) then
+      netjson_interface.addresses = addresses
+  end
 
     local info = safe_get_interface_info(name, netjson_interface)
     if info.stp ~= nil then netjson_interface.stp = info.stp end
@@ -932,6 +1024,74 @@ if not traffic_data then traffic_data = {} end
 netjson.realtimemonitor = {
   traffic = { dpi_client_data = dpiclient_data },
   real_time_traffic = { data = traffic_data }
+}
+
+-- === Read /tmp/ipsec.info and merge tunnels into netjson.ipsec.data.tunnels ===
+do
+  local ipsec_path = "/tmp/ipsec.info"
+  local ipsec_data, perr = read_json_file(ipsec_path)
+
+  -- ensure netjson.ipsec structure exists
+  netjson.ipsec = netjson.ipsec or {}
+  netjson.ipsec.data = netjson.ipsec.data or {}
+  netjson.ipsec.data.tunnels = netjson.ipsec.data.tunnels or {}
+
+  if not ipsec_data then
+    -- nothing to merge, optionally log perr (if you have logging)
+  else
+    -- possible shapes:
+    -- 1) { "tunnels": { "tunnels": [ ... ] } }
+    -- 2) { "tunnels": [ ... ] }
+    -- 3) { ... } (maybe already the expected object)
+    local incoming = nil
+    if type(ipsec_data) == "table" then
+      if ipsec_data.tunnels and type(ipsec_data.tunnels) == "table" and ipsec_data.tunnels.tunnels then
+        incoming = ipsec_data.tunnels.tunnels
+      elseif ipsec_data.tunnels and type(ipsec_data.tunnels) == "table" then
+        incoming = ipsec_data.tunnels
+      elseif ipsec_data.tunnels == nil and ipsec_data.tunnels == nil and next(ipsec_data) ~= nil then
+        -- fallback: if file already contains the exact data object we expect
+        -- (e.g. ipsec_data = { data = { tunnels = {...} } }) try to find it:
+        if ipsec_data.data and ipsec_data.data.tunnels then
+          incoming = ipsec_data.data.tunnels
+        end
+      end
+    end
+
+    -- Build existing id map for dedupe
+    local existing_ids = {}
+    for _, t in ipairs(netjson.ipsec.data.tunnels) do
+      if type(t) == "table" and t.id then existing_ids[t.id] = true end
+    end
+
+    -- If incoming is a table/array, append deduped entries
+    if type(incoming) == "table" then
+      for _, t in ipairs(incoming) do
+        if type(t) == "table" then
+          local id = t.id
+          if id and not existing_ids[id] then
+            table.insert(netjson.ipsec.data.tunnels, t)
+            existing_ids[id] = true
+          elseif not id then
+            -- no id: append anyway (can't dedupe)
+            table.insert(netjson.ipsec.data.tunnels, t)
+          end
+        end
+      end
+    else
+      -- No tunnels array found; if ipsec_data looks like a full data object, merge it in
+      -- Only set netjson.ipsec.data.raw if needed for debugging/inspection
+      netjson.ipsec.data.raw = netjson.ipsec.data.raw or ipsec_data
+    end
+  end
+end
+
+
+local ipsec_data, terr = read_json_file("/tmp/ipsec.info")
+if not ipsec_data then ipsec_data = {} end
+
+netjson.ipsec = {
+  data = ipsec_data
 }
 
 -- final output
