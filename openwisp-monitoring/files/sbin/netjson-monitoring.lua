@@ -928,8 +928,8 @@ do
           packet_loss = pkt_loss
         }
 
-        local thr = extract_throughput_from_record(rec)
-        if thr then ping_obj.throughput = thr end
+        --local thr = extract_throughput_from_record(rec)
+        --if thr then ping_obj.throughput = thr end
 
         target_iface.ping = ping_obj
       else

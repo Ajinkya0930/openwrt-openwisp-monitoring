@@ -226,6 +226,11 @@ send_data() {
                                     fi
                                     # remove saved data file after success
                                     rm -f "$payload_file"
+
+                                    # ---- create empty success flag ----
+                                    touch /tmp/sdcontroller_update_success.flag
+                                    # -----------------------------------
+
                                     break
                             elif [ "$response_code" = "400" ]; then
                                     logger -s "Data not sent successfully (HTTP status $response_code), discarding data." \
