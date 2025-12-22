@@ -122,7 +122,7 @@ save_data() {
 				-p daemon.info
 		fi
 		# get process id of the process sending data
-		pid=$(pgrep -f "openwisp-monitoring.*--mode send")
+		pid=$(pgrep -f "openwisp-monitoring.*--mode send" | head -n 1)
 		kill -SIGUSR1 "$pid"
 		sleep "$INTERVAL"
 	done
