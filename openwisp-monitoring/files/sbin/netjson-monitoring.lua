@@ -111,6 +111,10 @@ end
 local function is_bad_iface_name(name)
   if not name then return true end
   if name == "lo" then return true end
+
+  -- EXCLUDE inter-lan
+  if name == "inter-lan" then return true end
+
   if name == "gre0" or name == "gretap0" or name == "sit0"
      or name == "ip6tnl0" or name == "ip6_vti0" or name == "teql0"
      or name == "tunl0" then
@@ -137,7 +141,8 @@ local function map_iface_name_to_eth(name)
   if ethplain then return "eth" .. tonumber(ethplain) end
   local lan = nm:match("^lan0*(%d+)$") or nm:match("^lan([0-9]+)$")
   if lan then return "eth" .. tonumber(lan) end
-  if nm == "inter-lan" then return "eth0" end
+  -- Do NOT map inter-lan to eth0 (it collides with lan0->eth0)
+  if name == "inter-lan" then return true end
   return nm
 end
 
@@ -582,10 +587,10 @@ if not monitoring.utils.is_table_empty(dhcp_leases) then
   netjson.dhcp_leases = dhcp_leases
 end
 
-local host_neighbors = monitoring.neighbors.get_neighbors()
-if not monitoring.utils.is_table_empty(host_neighbors) then
-  netjson.neighbors = host_neighbors
-end
+-- local host_neighbors = monitoring.neighbors.get_neighbors()
+-- if not monitoring.utils.is_table_empty(host_neighbors) then
+--   netjson.neighbors = host_neighbors
+-- end
 
 ----------------------------------------------------------------
 -- Determine interfaces to monitor (argument: "*" or space-separated list)
@@ -682,7 +687,8 @@ for _, name in ipairs(ifs) do
 
     -- statistics: take counters by original sys name, but attach to canonical mapped interface
     if monitor_all or include_stats[name] or include_stats[mapped_name] then
-      local st = counters[name] or counters[mapped_name]
+      --local st = counters[name] or counters[mapped_name]
+      local st = counters[name]   -- always use real kernel name (lan0/lan1/...)
       if st then
         local rx_bytes = st.rx_bytes
         local rx_packets = st.rx_packets
