@@ -31,13 +31,17 @@ local sernum_file = io.popen('cat /sys/class/dmi/id/board_serial')
 local serial_number = sernum_file:read()
 sernum_file:close()
 
+-- This is UTC epoch time
+local f = io.popen("date +%s")                                    
+local timestamp = tonumber(f:read("*l"))                    
+f:close()
 
 -- init netjson data structure
 local netjson = {
   type = 'DeviceMonitoring',
   general = {
     hostname = board.hostname,
-    local_time = system_info.localtime,
+    local_time = timestamp, --system_info.localtime,
     uptime = system_info.uptime,
     serialnumber = serial_number
   },
