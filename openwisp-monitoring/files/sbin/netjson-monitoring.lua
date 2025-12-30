@@ -59,10 +59,10 @@ if not monitoring.utils.is_table_empty(dhcp_leases) then
   netjson.dhcp_leases = dhcp_leases
 end
 
-local host_neighbors = monitoring.neighbors.get_neighbors()
-if not monitoring.utils.is_table_empty(host_neighbors) then
-  netjson.neighbors = host_neighbors
-end
+-- local host_neighbors = monitoring.neighbors.get_neighbors()
+-- if not monitoring.utils.is_table_empty(host_neighbors) then
+--   netjson.neighbors = host_neighbors
+-- end
 
 -- determine the interfaces to monitor
 local arg = {...}
