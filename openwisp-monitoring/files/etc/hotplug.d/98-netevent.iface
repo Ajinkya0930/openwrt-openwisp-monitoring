@@ -1,0 +1,11 @@
+#!/bin/sh
+TS=$(date +%s)
+
+[ -p /tmp/netevents.fifo ] || exit 0
+
+(
+  echo "[IFACE] ts=$TS ACTION=$ACTION INTERFACE=$INTERFACE DEVICE=$DEVICE PROTO=$PROTO"
+) >> /tmp/netevents.fifo 2>/dev/null &
+
+exit 0
+

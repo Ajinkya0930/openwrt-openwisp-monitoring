@@ -103,7 +103,9 @@ define Package/openwisp-monitoring/install
 		$(1)/etc/init.d \
 		$(1)/etc/config \
 		$(1)/usr/lib/openwisp-monitoring \
-		$(1)/etc/hotplug.d/openwisp
+		$(1)/etc/hotplug.d/openwisp \
+		$(1)/etc/hotplug.d/iface \
+		$(1)/etc/hotplug.d/net
 
 	$(INSTALL_BIN) \
 		files/monitoring.agent \
@@ -126,12 +128,28 @@ define Package/openwisp-monitoring/install
 		$(1)/usr/sbin/collect_dpi_client_data.py
 
 	$(INSTALL_BIN) \
-		files/sbin/wan_monitor.sh \
-		$(1)/usr/sbin/wan_monitor.sh
+		files/sbin/wanlink_ping_sla.py \
+		$(1)/usr/sbin/wanlink_ping_sla.py
 	
 	$(INSTALL_BIN) \
-		files/sbin/ipsec_monitor.sh \
-		$(1)/usr/sbin/ipsec_monitor.sh
+		files/sbin/neteventd.py \
+		$(1)/usr/sbin/neteventd.py
+
+	$(INSTALL_BIN) \
+		files/etc/init.d/wanlink_ping_sla \
+		$(1)/etc/init.d/wanlink_ping_sla
+	
+	$(INSTALL_BIN) \
+		files/etc/init.d/neteventd \
+		$(1)/etc/init.d/neteventd
+	
+	$(INSTALL_BIN) \
+		files/etc/hotplug.d/98-netevent.iface \
+		$(1)/etc/hotplug.d/iface/98-netevent
+	
+	$(INSTALL_BIN) \
+		files/etc/hotplug.d/98-netevent.net \
+		$(1)/etc/hotplug.d/net/98-netevent
 endef
 
 $(eval $(call BuildPackage,openwisp-monitoring))
