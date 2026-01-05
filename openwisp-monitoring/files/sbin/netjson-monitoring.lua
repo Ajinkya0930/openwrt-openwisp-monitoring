@@ -39,6 +39,7 @@ f:close()
 -- init netjson data structure
 local netjson = {
   type = 'DeviceMonitoring',
+  device_type = 'firewall',
   general = {
     hostname = board.hostname,
     local_time = timestamp, --system_info.localtime,
@@ -120,6 +121,21 @@ for _, radio in pairs(wireless_status) do
   end
 end
 
+
+--======= this is helper function for check interface up and down ==========
+local function operstate_is_up(ifname)
+  local path = "/sys/class/net/" .. ifname .. "/operstate"
+  local f = io.open(path, "r")
+  if not f then return nil end
+  local s = f:read("*l")
+  f:close()
+  if s then
+    s = s:match("^%s*(.-)%s*$") -- trim
+    return (s == "up")
+  end
+  return nil
+end
+
 --------------------- new patch for interfaces ---------------------------------------
 -- collect interface stats
 for name, interface in pairs(network_status) do
@@ -127,7 +143,6 @@ for name, interface in pairs(network_status) do
     local netjson_interface = {
       name = name,
       type = string.lower(interface.type),
-      up = interface.up,
       mac = interface.macaddr,
       txqueuelen = interface.txqueuelen,
       mtu = interface.mtu,
@@ -148,10 +163,18 @@ for name, interface in pairs(network_status) do
       end
       netjson_interface['bridge_members'] = bridge_members
     end
+
+    local op_up = operstate_is_up(name)
+    if op_up ~= nil then
+      netjson_interface.up = op_up
+    else
+      netjson_interface.up = interface.up -- fallback to existing value
+    end
     if wireless_interfaces[name] then
       monitoring.utils.dict_merge(wireless_interfaces[name], netjson_interface)
       interface.type = netjson_interface.type
     end
+
     if interface.type == 'Network device' then
       local link_supported = interface['link-supported']
       if link_supported and next(link_supported) then
@@ -252,12 +275,109 @@ for _, intf in ipairs(host_interfaces) do
 end
 -- <<< WAN ANNOTATION END
 
+-- === Inserted: optimized, no-log, no-ts ping-merger ===
+-- === Inserted: merge that writes single "ping" object per interface (formatted) ===
+local function find_interface_for_merge(interfaces, devname)
+  for _, iface in ipairs(interfaces or {}) do
+    if iface.name == devname or iface.device == devname
+       or (iface.wan_info and (iface.wan_info.device == devname or iface.wan_info.iface == devname)) then
+      return iface
+    end
+  end
+  return nil
+end
+
+local function attach_ping_formatted(iface, ping)
+  if not iface or type(ping) ~= "table" then return end
+
+  -- packet_loss comes as number now (0.0 / 100.0). Keep readable "%".
+  local pl = ping.packet_loss
+  local pl_str = nil
+  if type(pl) == "number" then
+    -- keep integer-like formatting when possible
+    if pl == math.floor(pl) then
+      pl_str = tostring(math.floor(pl)) .. "%"
+    else
+      pl_str = tostring(pl) .. "%"
+    end
+  elseif type(pl) == "string" then
+    -- if already contains %, keep it, else append
+    if pl:find("%%") then pl_str = pl else pl_str = pl .. "%" end
+  end
+
+  -- handle "start time" key which has a space in it
+  local start_time = ping["start time"] or ping.start_time or ping.starttime
+
+  iface.ping = {
+    -- identity / routing
+    target = ping.target,                       -- NEW
+    dest_ip = ping.destination or ping.dest_ip or ping.dst,  -- existing support
+
+    -- health/status
+    status = ping.status,                       -- NEW ("up"/"down")
+    latency_ms = (type(ping.latency_avg_ms) == "number" and ping.latency_avg_ms) or tonumber(ping.latency_avg_ms),
+    jitter_ms  = (type(ping.jitter_ms) == "number" and ping.jitter_ms) or tonumber(ping.jitter_ms),
+    packet_loss = pl_str,                       -- now formatted "0%" / "100%"
+
+    -- availability window
+    start_time = (type(start_time) == "number" and start_time) or tonumber(start_time), -- NEW
+    uptime_sec = (type(ping.uptime_sec) == "number" and ping.uptime_sec) or tonumber(ping.uptime_sec), -- NEW
+    downtime_sec = (type(ping.downtime_sec) == "number" and ping.downtime_sec) or tonumber(ping.downtime_sec), -- NEW
+    availability_percent =
+      (type(ping.availability_percent) == "number" and ping.availability_percent) or tonumber(ping.availability_percent) -- NEW
+  }
+
+  -- OPTIONAL: if you want to avoid null keys in output, you can clean nil values
+  -- (Lua cjson usually skips nil keys anyway, but keeping this comment for clarity)
+end
+
+
+local function merge_ping_metrics(interfaces, ping_file_path, opts)
+  opts = opts or {}
+  local create_missing = opts.create_missing ~= false
+  if type(interfaces) ~= "table" then return false, "interfaces_not_table" end
+
+  local fh, err = io.open(ping_file_path, "r")
+  if not fh then return false, err end
+  local content = fh:read("*a"); fh:close()
+
+  local ok, data = pcall(cjson.decode, content)
+  if not ok or type(data) ~= "table" then return false, "json_decode_failed" end
+
+  local attached = 0
+  for _, ping in ipairs(data) do
+    local devname = ping.device_name or ping.device or ping.iface or ping.interface
+    if devname then
+      local iface = find_interface_for_merge(interfaces, devname)
+      if not iface and create_missing then
+        iface = { name = devname, device = devname, type = "ethernet", up = true }
+        interfaces[#interfaces + 1] = iface
+      end
+      if iface then
+        attach_ping_formatted(iface, ping)
+        attached = attached + 1
+      end
+    end
+  end
+
+  return true, attached
+end
+-- === end inserted block ===
+
+-- Merge ping metrics into host_interfaces if any (no logging, no ts)
+pcall(function()
+  if next(host_interfaces) ~= nil then
+    merge_ping_metrics(host_interfaces, "/tmp/ping_metrics.json", { create_missing = true })
+  end
+end)
+
+
 if next(host_interfaces) ~= nil then netjson.interfaces = host_interfaces end
 if next(dns_servers) ~= nil then netjson.dns_servers = dns_servers end
 if next(dns_search) ~= nil then netjson.dns_search = dns_search end
 
 
--- This function is common to all when we read the data from the /etc/config file..................................                                               
+-- This function is common to all when we read the data from the /etc/config file...........
 local function read_config(config_name)
     local result = {}
 

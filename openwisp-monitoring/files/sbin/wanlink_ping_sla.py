@@ -144,14 +144,14 @@ def ping_target(iface, target):
 
 def save_json_to_tmp(payload):
     """Save the final 3-minute JSON bundle to /tmp."""
-    print("Inside the save to file....")
+    #print("Inside the save to file....")
     try:
-        path = "/tmp/iface_stats.json"
+        path = "/tmp/ping_metrics.json"     # final json data append into this file.
         with open(path, "w") as f:
             json.dump(payload, f, indent=2)
-        print(f"Saved JSON to {path}")
+        #print(f"Saved JSON to {path}")
     except Exception as e:
-        print(f"Error saving JSON: {e}", file=sys.stderr)
+        #print(f"Error saving JSON: {e}", file=sys.stderr)
 
 #===========================
 # SAVE DATA INTO CSV FILE
@@ -182,11 +182,12 @@ def save_data_into_csv(sample, interface_name):
 #===========================
 def read_downtime_from_csv(iface_name):
     filename = f"{CSV_DIR}/{iface_name}.csv"
-    last_row = None
-    first_row = None
 
     if not os.path.exists(filename):
-        return 0,0,0
+        return 0, 0, 0
+    
+    last_row = None
+    first_row = None
 
     with open(filename, newline="") as f:
         reader = csv.DictReader(f)
@@ -194,11 +195,14 @@ def read_downtime_from_csv(iface_name):
         for row in reader:
             last_row = row
     
-    start_time = int(first_row["timestamp"])
+    if not first_row:
+        return 0, 0, 0
+    
+    start_time = int(first_row.get("timestamp", 0) or 0)
 
     if last_row is not None:
-        downtime = int(last_row["downtime"])   # or float(), depending on your CSV
-        uptime = int(last_row["uptime"])   # or float(), depending on your CSV
+        downtime = int(last_row.get("downtime") or 0)
+        uptime = int(last_row.get("uptime") or 0)
         #print("Last downtime:", downtime)
     else:
         #print("CSV is empty")
@@ -235,9 +239,9 @@ def main():
         print("No eth* interfaces with IPv4 found.", file=sys.stderr)
         return
 
-    print(f"Monitoring interfaces:- {interfaces}")
-    print(f"Sample interval: {INTERVAL_SECONDS} seconds")
-    print(f"Bundle size: {SAMPLES_PER_SEND} samples (3 minutes total)")
+    # print(f"Monitoring interfaces:- {interfaces}")
+    # print(f"Sample interval: {INTERVAL_SECONDS} seconds")
+    # print(f"Bundle size: {SAMPLES_PER_SEND} samples (3 minutes total)")
 
     samples_buffer = []
 
@@ -288,7 +292,7 @@ def main():
                 UpTime += INTERVAL
 
             # Availability calculation
-            print(f"uptime --> {UpTime} and downtime ==> {DownTime}")
+            #print(f"uptime --> {UpTime} and downtime ==> {DownTime}")
             Availability_Percent = UpTime / (UpTime + DownTime) * 100
             Availability_Percent = round(Availability_Percent, 2)       #this will save two decimal value.
             #print(f"--- Time and percentage --> {Availability_Time},{Availability_Percent}")
@@ -307,11 +311,12 @@ def main():
 
             # Build iface JSON exactly in your desired format
             json_file_entry = {
+                "device_name": iface,
                 "target": ip_addr,
                 "destination": DEFAULT_PING_FALLBACK, 
                 "latency_ms": ping_stats["latency_ms_avg"], # average latency in ms
                 "jitter_ms": ping_stats["jitter_ms"],
-                "loss_percent": ping_stats["loss_percent"],
+                "packet_loss": ping_stats["loss_percent"],
                 "status": ping_stats["status"],  # "up" or "down"
                 "start time": Start_Time,
                 "uptime_sec": UpTime,
@@ -354,6 +359,4 @@ if __name__ == "__main__":
         main()
     except KeyboardInterrupt:
         print("Exiting on Ctrl+C")
-
-
 
