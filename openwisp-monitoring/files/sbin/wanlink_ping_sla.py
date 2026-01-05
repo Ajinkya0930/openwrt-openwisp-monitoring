@@ -151,7 +151,7 @@ def save_json_to_tmp(payload):
             json.dump(payload, f, indent=2)
         #print(f"Saved JSON to {path}")
     except Exception as e:
-        #print(f"Error saving JSON: {e}", file=sys.stderr)
+        print(f"Error saving JSON: {e}", file=sys.stderr)
 
 #===========================
 # SAVE DATA INTO CSV FILE

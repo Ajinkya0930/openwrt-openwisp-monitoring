@@ -290,46 +290,37 @@ end
 local function attach_ping_formatted(iface, ping)
   if not iface or type(ping) ~= "table" then return end
 
-  -- packet_loss comes as number now (0.0 / 100.0). Keep readable "%".
-  local pl = ping.packet_loss
-  local pl_str = nil
-  if type(pl) == "number" then
-    -- keep integer-like formatting when possible
-    if pl == math.floor(pl) then
-      pl_str = tostring(math.floor(pl)) .. "%"
-    else
-      pl_str = tostring(pl) .. "%"
-    end
-  elseif type(pl) == "string" then
-    -- if already contains %, keep it, else append
-    if pl:find("%%") then pl_str = pl else pl_str = pl .. "%" end
-  end
-
-  -- handle "start time" key which has a space in it
+  -- "start time" has a space in key name
   local start_time = ping["start time"] or ping.start_time or ping.starttime
 
+  -- keep numeric (float) values as-is
+  local latency = ping.latency_ms
+  if latency == nil then latency = ping.latency_ms end
+
+  local loss = ping.packet_loss
+  -- if it somehow comes as string, convert to number
+  if type(loss) == "string" then loss = tonumber(loss) end
+
   iface.ping = {
-    -- identity / routing
-    target = ping.target,                       -- NEW
-    dest_ip = ping.destination or ping.dest_ip or ping.dst,  -- existing support
+    availability_percent = ping.availability_percent,
+    uptime_sec = ping.uptime_sec,
+    downtime_sec = ping.downtime_sec,
+    start_time = start_time,
 
-    -- health/status
-    status = ping.status,                       -- NEW ("up"/"down")
-    latency_ms = (type(ping.latency_avg_ms) == "number" and ping.latency_avg_ms) or tonumber(ping.latency_avg_ms),
-    jitter_ms  = (type(ping.jitter_ms) == "number" and ping.jitter_ms) or tonumber(ping.jitter_ms),
-    packet_loss = pl_str,                       -- now formatted "0%" / "100%"
+    status = ping.status,
+    dest_ip = ping.destination or ping.dest_ip or ping.dst,
+    target = ping.target,
 
-    -- availability window
-    start_time = (type(start_time) == "number" and start_time) or tonumber(start_time), -- NEW
-    uptime_sec = (type(ping.uptime_sec) == "number" and ping.uptime_sec) or tonumber(ping.uptime_sec), -- NEW
-    downtime_sec = (type(ping.downtime_sec) == "number" and ping.downtime_sec) or tonumber(ping.downtime_sec), -- NEW
-    availability_percent =
-      (type(ping.availability_percent) == "number" and ping.availability_percent) or tonumber(ping.availability_percent) -- NEW
+    jitter_ms = ping.jitter_ms,
+
+    -- IMPORTANT: use same key name as your ping JSON
+    latency_ms = latency,
+
+    -- IMPORTANT: keep float number like 100.0 / 0.0
+    packet_loss = loss
   }
-
-  -- OPTIONAL: if you want to avoid null keys in output, you can clean nil values
-  -- (Lua cjson usually skips nil keys anyway, but keeping this comment for clarity)
 end
+
 
 
 local function merge_ping_metrics(interfaces, ping_file_path, opts)
