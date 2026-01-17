@@ -558,6 +558,8 @@ if f then
   serial_num = s:match("devsn%s*[:=]%s*(%S+)") or ""
 end
 
+-- this will get the correct epoch time as per IST
+local current_epoch = os.time()
 ----------------------------------------------------------------
 -- Init NetJSON
 ----------------------------------------------------------------
@@ -566,7 +568,7 @@ local netjson = {
   device_type = '4g_5g_router',
   general = {
     hostname   = board.hostname,
-    local_time = system_info.localtime,
+    local_time = current_epoch, --system_info.localtime,
     uptime     = system_info.uptime,
     serialnumber = serial_num
   },
@@ -981,21 +983,21 @@ if cellular_modem or cellular_modem2 then
   if cellular_modem2 then netjson.cellular.modem2 = cellular_modem2 end
 end
 
-netjson.wlan = {}
-local wlan_kv = read_kv_file("/tmp/wlan.info")
-if wlan_kv then netjson.wlan.wlan_data = wlan_kv end
+-- netjson.wlan = {}
+-- local wlan_kv = read_kv_file("/tmp/wlan.info")
+-- if wlan_kv then netjson.wlan.wlan_data = wlan_kv end
 
 netjson.device = {}
 local device_kv = read_kv_file("/tmp/device.info")
 if device_kv then netjson.device.device_info = device_kv end
 
-netjson.ethernet = {
-  eth1_data = read_kv_file("/tmp/eth1.info"),
-  eth2_data = read_kv_file("/tmp/eth2.info"),
-  eth3_data = read_kv_file("/tmp/eth3.info"),
-  eth4_data = read_kv_file("/tmp/eth4.info"),
-  eth5_data = read_kv_file("/tmp/eth5.info")
-}
+-- netjson.ethernet = {
+--   eth1_data = read_kv_file("/tmp/eth1.info"),
+--   eth2_data = read_kv_file("/tmp/eth2.info"),
+--   eth3_data = read_kv_file("/tmp/eth3.info"),
+--   eth4_data = read_kv_file("/tmp/eth4.info"),
+--   eth5_data = read_kv_file("/tmp/eth5.info")
+-- }
 
 netjson.performance_sla = {
   data = read_kv_file("/tmp/performance_sla.info")
