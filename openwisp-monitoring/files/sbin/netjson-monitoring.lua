@@ -32,8 +32,8 @@ local serial_number = sernum_file:read()
 sernum_file:close()
 
 -- This is UTC epoch time
-local f = io.popen("date +%s")                                    
-local timestamp = tonumber(f:read("*l"))                    
+local f = io.popen("date +%s")
+local timestamp = tonumber(f:read("*l"))
 f:close()
 
 -- init netjson data structure
@@ -76,7 +76,7 @@ end
 
 -- collect device data
 local network_status = ubus:call('network.device', 'status', {})
-local wireless_status = ubus:call('network.wireless', 'status', {})
+--local wireless_status = ubus:call('network.wireless', 'status', {})
 local vpn_interfaces = monitoring.interfaces.get_vpn_interfaces()
 local wireless_interfaces = {}
 local host_interfaces = {}
@@ -84,6 +84,7 @@ local dns_servers = {}
 local dns_search = {}
 
 -- collect relevant wireless interface stats
+--[[
 for _, radio in pairs(wireless_status) do
   for _, interface in ipairs(radio.interfaces) do
     local name = interface.ifname
@@ -120,7 +121,7 @@ for _, radio in pairs(wireless_status) do
     end
   end
 end
-
+]]
 
 --======= this is helper function for check interface up and down ==========
 local function operstate_is_up(ifname)
@@ -170,10 +171,11 @@ for name, interface in pairs(network_status) do
     else
       netjson_interface.up = interface.up -- fallback to existing value
     end
-    if wireless_interfaces[name] then
-      monitoring.utils.dict_merge(wireless_interfaces[name], netjson_interface)
-      interface.type = netjson_interface.type
-    end
+    
+    -- if wireless_interfaces[name] then
+    --   monitoring.utils.dict_merge(wireless_interfaces[name], netjson_interface)
+    --   interface.type = netjson_interface.type
+    -- end
 
     if interface.type == 'Network device' then
       local link_supported = interface['link-supported']
@@ -322,7 +324,6 @@ local function attach_ping_formatted(iface, ping)
 end
 
 
-
 local function merge_ping_metrics(interfaces, ping_file_path, opts)
   opts = opts or {}
   local create_missing = opts.create_missing ~= false
@@ -398,7 +399,7 @@ local function read_config(config_name)
     return result
 end
 
--- This function for /etc/frr/ read config from this files.......................................................
+-- This function for /etc/frr/ read config from this files...............
 local function read_frr_config(filename)
     local result = {}
     local full_path = "/etc/frr/" .. filename
@@ -415,112 +416,134 @@ end
  
 -- Collect data of System ......taking data of snmp,tr069,icmp check, schedule
 netjson.system = {
-	snmp      = read_config("snmp"),
-	tr069     = read_config("tr069"),
-	icmpcheck = read_config("icmpcheck"),
-	schedule  = read_config("schedule")
+    snmp      = read_config("snmp"),
+    tr069     = read_config("tr069"),
+    icmpcheck = read_config("icmpcheck"),
+    schedule  = read_config("schedule"),
+    topology  = read_config("topology"),
+    tacc_auth = read_config("tacc")
+}
+
+-- Collect data of Network --> DNS and DHCP tab.
+netjson.network = {
+    dns_and_dhcp = {
+      dhcp_and_mac_binding = ubus:call('ns.dhcp', 'list-interfaces', {}) or {} ,
+      static_leases = ubus:call('ns.dhcp', 'list-static-leases', {}) or {} ,
+      dynamic_lease = ubus:call('ns.dhcp', 'list-active-leases', {}) or {} ,
+      dns = ubus:call('ns.dns', 'get-config', {}) or {} ,
+      dns_records = ubus:call('ns.dns', 'list-records', {}) or {} ,
+      scan_network = ubus:call('ns.scan', 'list-interfaces', {}) or {} 
+    },
+    static_routes = {
+      ipv4_routes = ubus:call('ns.routes', 'list-routes', {protocol = 'ipv4'}) or {},
+      ipv4_maintable = ubus:call('ns.routes', 'main-table', {protocol = 'ipv4'}) or {},
+      ipv6_routes = ubus:call('ns.routes', 'list-routes', {protocol = 'ipv6'}) or {},
+      ipv6_maintable = ubus:call('ns.routes', 'main-table', {protocol = 'ipv6'}) or {}
+    },
+    FlowEdge_Multiwan = {
+      multiwan_manager = { Manager_Policy = ubus:call('ns.mwan', 'index_policies', {}) or {},
+      manager_rules = ubus:call('ns.mwan', 'index_rules', {}) or {} },
+      general_settings = { ubus:call('ns.mwan', 'get_default_config', {}) or {}}
+    },
+    -- LoadBalance = read_config("loadbalance"),
+    bond = read_config("nsbond"),
+    reverse_proxy = { ubus:call('ns.reverseproxy', 'list-proxies', {}) or {} }    
+}
+
+-- collect High availability function tabs
+netjson.high_availability = {
+    vrrp = read_config("vrrp")
+}
+
+-- Collect policy engine data tabs 
+netjson.policy_engine = {
+    qos = { ubus:call('ns.qos', 'list', {}) or {} },
+    rip = read_frr_config("ripd.conf"),
+    bgp = read_frr_config("bgpd.conf"), 
+    ospf = read_frr_config("ospfd.conf"),
+    vrf = read_config("vrf"),
+    performance_sla = read_config("sla"),
+    application_aware_routing = read_config("ptl_route")
 }
 
 -- Add firewall information
 netjson.firewall = {
     port_forward = {
-	ubus:call('ns.redirects', 'list-redirects', {}) or {}
+      ubus:call('ns.redirects', 'list-redirects', {}) or {}
     },
     nat = {
-	rules = ubus:call('ns.nat', 'list-rules', {}) or {},
-	netmap = ubus:call('ns.netmap', 'list-rules', {}) or {},
-	nat_helper = ubus:call('ns.nathelpers', 'list-nat-helpers', {}) or {}
+      rules = ubus:call('ns.nat', 'list-rules', {}) or {},
+      netmap = ubus:call('ns.netmap', 'list-rules', {}) or {},
+      nat_helper = ubus:call('ns.nathelpers', 'list-nat-helpers', {}) or {}
     },
     rules = {
- 	zones = ubus:call('ns.firewall', 'list_zones', {}) or {},
- 	forwardings = ubus:call('ns.firewall', 'list_forwardings', {}) or {},
- 	input_rules = ubus:call('ns.firewall', 'list-input-rules', {}) or {},
-	output_rules = ubus:call('ns.firewall', 'list-output-rules', {}) or {},
-	forward_rules = ubus:call('ns.firewall', 'list-forward-rules', {}) or {},
-	redirects = ubus:call('ns.firewall', 'list_redirects', {}) or {}
+      zones = ubus:call('ns.firewall', 'list_zones', {}) or {},
+      forwardings = ubus:call('ns.firewall', 'list_forwardings', {}) or {},
+      input_rules = ubus:call('ns.firewall', 'list-input-rules', {}) or {},
+      output_rules = ubus:call('ns.firewall', 'list-output-rules', {}) or {},
+      forward_rules = ubus:call('ns.firewall', 'list-forward-rules', {}) or {},
+      redirects = ubus:call('ns.firewall', 'list_redirects', {}) or {}
     },
     connections = {
-	ubus:call('ns.conntrack', 'list', {}) or {}
-    }
-}
-
-
--- Collect data of Network --> DNS and DHCP tab.
-netjson.network = {
-    DNS_DHCP = {
-	DHCP_MAC = ubus:call('ns.dhcp', 'list-interfaces', {}) or {} ,
-	Static_Lease = ubus:call('ns.dhcp', 'list-static-leases', {}) or {} ,
-	Dynamic_Lease = ubus:call('ns.dhcp', 'list-active-leases', {}) or {} ,
-	DNS = ubus:call('ns.dns', 'get-config', {}) or {} ,
-	DNS_Records = ubus:call('ns.dns', 'list-records', {}) or {} ,
- 	Scan_Network = ubus:call('ns.scan', 'list-interfaces', {}) or {} 
+      ubus:call('ns.conntrack', 'list', {}) or {}
     },
-    Routes = {
-	IPV4_Routes = ubus:call('ns.routes', 'list-routes', {protocol = 'ipv4'}) or {},
-	IPV4_Maintable = ubus:call('ns.routes', 'main-table', {protocol = 'ipv4'}) or {},
-	IPV6_Routes = ubus:call('ns.routes', 'list-routes', {protocol = 'ipv6'}) or {},
-	IPV6_Maintable = ubus:call('ns.routes', 'main-table', {protocol = 'ipv6'}) or {}
-    },
-    VxLan = read_config("vxlan"), 
-    FlowEdge_Multiwan = {
-	Multiwan_Manager = { Manager_Policy = ubus:call('ns.mwan', 'index_policies', {}) or {},
-	Manager_Rules = ubus:call('ns.mwan', 'index_rules', {}) or {} },
-	General_Settings = { ubus:call('ns.mwan', 'get_default_config', {}) or {}}
-    },
-    LoadBalance = read_config("loadbalance"),
-    Reverse_Proxy = { ubus:call('ns.reverseproxy', 'list-proxies', {}) or {} },
-    QoS = { ubus:call('ns.qos', 'list', {}) or {} },
-    Advanced_QoS = read_config("advance_qos"),
-    RIP = read_frr_config("ripd.conf"),
-    OSPF = read_frr_config("ospfd.conf"),
-    BGP = read_frr_config("bgpd.conf"),
-    VRF = read_config("vrf")
-    
-}
-
--- Collect data of VPN tab 
-netjson.vpn = {
-	OpenVPN_Tunnel = { ubus:call('ns.ovpntunnel', 'list-tunnels', {}) or {} },
-	IPSec_Tunnel = { server_tunnel = read_config("ipsec"),
-	Static_Lease = ubus:call('ns.ipsectunnel', 'list-tunnels', {}) or {} },
-	L2TP = { server = read_config("l2tp_server") }, 
-	VRRP = read_config("vrrp"),
-	ZeroTier = read_config("zerotier"),
-	Wireguard = { server = read_config("wireguard") },
-	OpenVPN = {
-		Instance = ubus:call('ns.ovpnrw', 'list-instances', {}) or {},
-		Configuration = ubus:call('ns.ovpnrw', 'get-configuration', { instance = "ns_roadwarrior1" }) or {}
+    zone_and_policies = {
+      ubus:call('ns.firewall', 'list_zones_no_aliases', {}) or {}
     }
 }
 
 -- Collect Security data from tab
 netjson.security = {
-     InstaShield_Field = {
-	blocklist_feeds = ubus:call('ns.threatshield', 'list-blocklist', {}) or {},
-	local_allowlist = ubus:call('ns.threatshield', 'list-allowed', {}) or {},
-	local_blocklist = ubus:call('ns.threatshield', 'list-blocked', {}) or {},
-	settings = ubus:call('ns.threatshield', 'list-settings', {}) or {}
+     instashield_field = {
+        blocklist_feeds = ubus:call('ns.threatshield', 'list-blocklist', {}) or {},
+        local_allowlist = ubus:call('ns.threatshield', 'list-allowed', {}) or {},
+        local_blocklist = ubus:call('ns.threatshield', 'list-blocked', {}) or {},
+        banned_ips = ubus:call('ns.threatshield', 'list-active-blocks', {}) or {},
+        settings = ubus:call('ns.threatshield', 'list-settings', {}) or {}
      },
-     Instashield_DNS = {
-	blocklist_sources = ubus:call('ns.threatshield', 'dns-list-blocklist', {}) or {},
-	Filter_bypass = ubus:call('ns.threatshield', 'dns-list-bypass', {}) or {},
-	local_blocklist = ubus:call('ns.threatshield', 'dns-list-blocked', {}) or {},
-	settings = ubus:call('ns.threatshield', 'dns-list-settings', {}) or {}
+     instashield_dns = {
+        blocklist_sources = ubus:call('ns.threatshield', 'dns-list-blocklist', {}) or {},
+        Filter_bypass = ubus:call('ns.threatshield', 'dns-list-bypass', {}) or {},
+        local_blocklist = ubus:call('ns.threatshield', 'dns-list-blocked', {}) or {},
+        local_allowlist = ubus:call('ns.threatshield', 'dns-list-allowed', {}) or {},
+        settings = ubus:call('ns.threatshield', 'dns-list-settings', {}) or {}
      },
-     DPI = {
-	rules = ubus:call('ns.dpi', 'list-rules', {}) or {},
-	exceptions = ubus:call('ns.dpi', 'list-exemptions', {}) or {}
+     dpi = {
+        rules = ubus:call('ns.dpi', 'list-rules', {}) or {},
+        exceptions = ubus:call('ns.dpi', 'list-exemptions', {}) or {}
      },
-     IPS = {
-	today_event_list = ubus:call('ns.snort', 'list-events', {}) or {},
+     ips = {
+        today_event_list = ubus:call('ns.snort', 'list-events', {}) or {},
         filter_bypass = ubus:call('ns.snort', 'list-bypasses', {}) or {},
         disabled_rules = ubus:call('ns.snort', 'list-disabled-rules', {}) or {},
         suppressed_alerts = ubus:call('ns.snort', 'list-suppressed-alerts', {}) or {},
         settings = ubus:call('ns.snort', 'settings', {}) or {}
      },
-     Antivirus = read_config("clamv"),
-     Antispam = read_config("rspamd")
+     antivirus = read_config("clamv"),
+     antispam = read_config("rspamd")
 
+}
+
+-- Collect data of VPN tab
+netjson.vpn = {
+    openvpn_road_warrior = {
+        ubus:call('ns.ovpnrw', 'list-instances', {}) or {}
+    },
+    openvpn_tunnel = {
+        ubus:call('ns.ovpntunnel', 'list-tunnels', {}) or {}
+    },
+    ipsec_tunnel = {
+        ubus:call('ns.ipsectunnel', 'list-tunnels', {}) or {}
+    },
+    wireguard_tunnel = {
+        server_tunnel = ubus:call('ns.wireguard', 'list-servers', {}) or {},
+        peer_tunnel   = ubus:call('ns.wireguard', 'list-tunnels', {}) or {}
+    },
+    l2tp = {
+        server = read_config("l2tp_server")
+    },
+    zerotier = read_config("zerotier"),
+    vxLan    = read_config("vxlan")
 }
 
 -- Collect Real Time Monitor Data.
@@ -647,26 +670,25 @@ else
 end
 
 netjson.realtimemonitor = {
-	traffic = {
-		dpi_summery_v2=ubus:call('ns.dpireport' ,'summary-v2' , {}) or {},
-		dpi_client_data= dpiclient_data
-	},
-	security = {
-		blocklist=ubus:call('ns.report' ,'tsip-malware-report' , {}) or {},
-		brute_force_attack=ubus:call('ns.report' ,'tsip-attack-report', {}) or {}
-	},
-	real_time_traffic = {
-		data=ubus:call('ns.talkers' , 'list' , {}) or {}
-	},
-	wan_uplink = {
-		wan_events = wanevents,
-		wan_traffic = wantraffic,
-		wan_lat_qua = wan_latquality
-	}
-	
+  traffic = {
+    dpi_summery_v2=ubus:call('ns.dpireport' ,'summary-v2' , {}) or {},
+    dpi_client_data= dpiclient_data
+  },
+  security = {
+    blocklist=ubus:call('ns.report' ,'tsip-malware-report' , {}) or {},
+    brute_force_attack=ubus:call('ns.report' ,'tsip-attack-report', {}) or {}
+  },
+  real_time_traffic = {
+    data=ubus:call('ns.talkers' , 'list' , {}) or {}
+  },
+  wan_uplink = {
+    wan_events = wanevents,
+    wan_traffic = wantraffic,
+    wan_lat_qua = wan_latquality
+  }
+  
 }
 
 io.write(cjson.encode(netjson))
 return cjson.encode(netjson)
-
 
