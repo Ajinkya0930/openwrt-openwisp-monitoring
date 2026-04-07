@@ -689,6 +689,44 @@ netjson.realtimemonitor = {
   
 }
 
+
+-- SD-WAN Bonding Metrics (merged into main monitoring payload)
+-- Replaces ns-bonding-report-monitoring cron to avoid race condition
+local sdwan = { daemon_running = false, daemon_uptime = 0, session_mode = "unknown", role = "unknown", tunnels = 0, links_up = 0, links_total = 0 }
+local sdwan_status_file = "/tmp/run/ns-bonding/status.json"
+local sf = io.open(sdwan_status_file, "r")
+if sf then
+  local content = sf:read("*a")
+  sf:close()
+  local sdwan_ok, sdwan_parsed = pcall(cjson.decode, content)
+  if sdwan_ok and type(sdwan_parsed) == "table" then
+    sdwan.daemon_running = true
+    sdwan.daemon_uptime = sdwan_parsed.uptime or 0
+    sdwan.session_mode = sdwan_parsed.session_mode or "unknown"
+    sdwan.role = sdwan_parsed.role or "unknown"
+    sdwan.tunnels = sdwan_parsed.tunnels or 0
+    if sdwan_parsed.links then
+      for _, ldata in pairs(sdwan_parsed.links) do
+        sdwan.links_total = sdwan.links_total + 1
+        if type(ldata) == "table" and ldata.quality and ldata.quality ~= "down" then
+          sdwan.links_up = sdwan.links_up + 1
+        end
+      end
+    end
+  end
+end
+local ipsec_enabled_val = uci:get("ns-bonding", "ipsec", "enabled") or "0"
+if ipsec_enabled_val == "1" then
+  local ipsec_h = io.popen("pidof charon >/dev/null 2>&1 && swanctl --list-sas 2>/dev/null | grep -c ESTABLISHED || echo 0")
+  local sa_count = tonumber(ipsec_h:read("*l") or "0") or 0
+  ipsec_h:close()
+  sdwan.ipsec_state = sa_count > 0 and "established" or "connecting"
+else
+  sdwan.ipsec_state = "disabled"
+end
+sdwan.overlay_ip = uci:get("ns-bonding", "settings", "tun_addr4") or ""
+netjson.sdwan = sdwan
+
 io.write(cjson.encode(netjson))
 return cjson.encode(netjson)
 
