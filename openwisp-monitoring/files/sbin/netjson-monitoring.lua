@@ -519,7 +519,7 @@ netjson.security = {
         suppressed_alerts = ubus:call('ns.snort', 'list-suppressed-alerts', {}) or {},
         settings = ubus:call('ns.snort', 'settings', {}) or {}
      },
-     antivirus = read_config("clamv"),
+     antivirus = read_config("clamav"),
      antispam = read_config("rspamd")
 
 }
