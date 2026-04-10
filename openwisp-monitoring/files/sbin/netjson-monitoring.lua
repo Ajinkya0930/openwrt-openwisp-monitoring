@@ -78,6 +78,21 @@ end
 local network_status = ubus:call('network.device', 'status', {})
 --local wireless_status = ubus:call('network.wireless', 'status', {})
 local vpn_interfaces = monitoring.interfaces.get_vpn_interfaces()
+local wan_device_status = {}
+do
+  -- Read the WAN status cache written by ns.dashboard list-wans
+  local cache_file = io.open('/tmp/wan_status_cache', 'r')
+  if cache_file then
+    local cache_content = cache_file:read('*a')
+    cache_file:close()
+    local ok, wan_statuses = pcall(cjson.decode, cache_content)
+    if ok and wan_statuses then
+      for device, status in pairs(wan_statuses) do
+        wan_device_status[device] = status  -- online / connected / offline
+      end
+    end
+  end
+end
 local wireless_interfaces = {}
 local host_interfaces = {}
 local dns_servers = {}
@@ -170,6 +185,12 @@ for name, interface in pairs(network_status) do
       netjson_interface.up = op_up
     else
       netjson_interface.up = interface.up -- fallback to existing value
+    end
+    -- Override with WAN internet reachability status (operstate=up does not mean internet works)
+    if wan_device_status[name] ~= nil then
+      local s = wan_device_status[name]
+      netjson_interface.wan_status = s  -- online / connected / offline
+      netjson_interface.up = (s == 'online' or s == 'connected')
     end
     
     -- if wireless_interfaces[name] then
