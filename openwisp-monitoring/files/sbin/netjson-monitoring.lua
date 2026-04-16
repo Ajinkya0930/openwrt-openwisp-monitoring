@@ -324,6 +324,10 @@ local function attach_ping_formatted(iface, ping)
   -- if it somehow comes as string, convert to number
   if type(loss) == "string" then loss = tonumber(loss) end
 
+  -- internet loss: keep as number
+  local inet_loss = ping.internet_loss_percent
+  if type(inet_loss) == "string" then inet_loss = tonumber(inet_loss) end
+
   iface.ping = {
     availability_percent = ping.availability_percent,
     uptime_sec = ping.uptime_sec,
@@ -340,7 +344,13 @@ local function attach_ping_formatted(iface, ping)
     latency_ms = latency,
 
     -- IMPORTANT: keep float number like 100.0 / 0.0
-    packet_loss = loss
+    packet_loss = loss,
+
+    -- Smart SLA: gateway + internet reachability
+    gateway = ping.gateway,
+    internet_status = ping.internet_status,
+    internet_latency_ms = ping.internet_latency_ms,
+    internet_loss_percent = inet_loss
   }
 end
 

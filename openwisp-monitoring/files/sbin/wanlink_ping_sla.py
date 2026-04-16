@@ -6,7 +6,10 @@ import os
 import sys
 import re
 import csv
+import signal
+import socket
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ==========================
 # CONFIGURATION
@@ -16,23 +19,40 @@ INTERVAL_SECONDS = 60          # measurement period (1 min)
 SAMPLES_PER_SEND = 3           # send every 3 samples (3 min)
 PING_COUNT = 10                # number of ping packets per run
 PING_INTERVAL = 0.2            # interval between ping packets (sec)
-DEFAULT_PING_FALLBACK = "8.8.8.8"  # fallback if no gateway found
-CSV_DIR = "/overlay/sla"
-
-#down time variable to calculate sla percentage.
-DownTime = 0
-UpTime = 0
-Availability_Percent = 0
-prev_downtime = 0
-
-DataCapture_Counter = 1
-TOTAL_TIME = 86400
+PING_TIMEOUT = 2               # max wait per packet reply (sec) — covers satellite links
+SUBPROCESS_TIMEOUT = 15        # hard kill if ping hangs beyond this (sec)
+TCP_CHECK_TIMEOUT = 3          # TCP connect fallback timeout (sec)
 INTERVAL = 60
+
+# Internet targets (tried in order, stop on first success)
+INTERNET_TARGETS = ["8.8.8.8", "1.1.1.1"]
+TCP_FALLBACK = ("8.8.8.8", 53)  # DNS port — almost never blocked
+
+# Storage: prefer /mnt/storage (disk, no flash wear), fall back to /tmp (RAM)
+if os.path.ismount("/mnt/storage"):
+    CSV_DIR = "/mnt/storage/sla"
+else:
+    CSV_DIR = "/tmp/sla"
+
+STATE_DIR = CSV_DIR
+
+# Graceful shutdown flag
+running = True
+
+def handle_signal(signum, frame):
+    global running
+    running = False
+
+signal.signal(signal.SIGTERM, handle_signal)
+signal.signal(signal.SIGINT, handle_signal)
 
 # ==========================
 # HELPER FUNCTIONS
 # ==========================
-def run_cmd(cmd):
+
+def run_cmd(cmd, timeout=None):
+    if timeout is None:
+        timeout = SUBPROCESS_TIMEOUT
     try:
         proc = subprocess.Popen(
             cmd,
@@ -41,8 +61,12 @@ def run_cmd(cmd):
             stderr=subprocess.PIPE,
             text=True
         )
-        out, err = proc.communicate()
+        out, err = proc.communicate(timeout=timeout)
         return out.strip(), err.strip(), proc.returncode
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+        return "", "timeout", 1
     except Exception as e:
         return "", str(e), 1
 
@@ -50,46 +74,72 @@ def run_cmd(cmd):
 def get_eth_interfaces():
     """
     Discover eth* interfaces from UCI (NOT IP-dependent).
-    Returns dict: {iface: ip_or_None}
+    Returns list of device names: ['eth0', 'eth1', ...]
     """
-    interfaces = {}
     device_name = []
 
-    # 1. Get all logical network interfaces
     out, err, rc = run_cmd("uci show network | grep '=interface'")
     if rc != 0:
         print(f"Failed to read UCI network: {err}", file=sys.stderr)
-        return interfaces
+        return device_name
 
     for line in out.splitlines():
-        # network.WAN1=interface
         iface = line.split('.')[1].split('=')[0]
 
-        # 2. Get device name (ethX)
         dev_out, _, _ = run_cmd(f"uci get network.{iface}.device")
         dev = dev_out.strip()
 
         if not dev.startswith("eth"):
             continue
-        else:
+
+        if dev not in device_name:
             device_name.append(dev)
 
-        #print(f"device names --> {device_name}")
-
-        # 3. Get IP if present (optional)
-        ip_out, _, _ = run_cmd(f"ip -o -4 addr show dev {dev} scope global")
-        ip = None
-        if ip_out:
-            parts = ip_out.split()
-            if len(parts) >= 4:
-                ip = parts[3].split("/")[0]
-
-        interfaces[dev] = ip
-
-    return device_name #interfaces
+    return device_name
 
 
-def ping_target(iface, target):
+def get_iface_ip(iface):
+    """Get IPv4 address for an interface."""
+    ip_out, _, _ = run_cmd(f"ip -o -4 addr show dev {iface} scope global")
+    if ip_out:
+        parts = ip_out.split()
+        if len(parts) >= 4:
+            return parts[3].split("/")[0]
+    return None
+
+
+def get_gateway(iface):
+    """Auto-detect gateway IP for an interface from routing table."""
+    out, _, _ = run_cmd(f"ip -4 route show dev {iface} default")
+    if out:
+        parts = out.split()
+        if "via" in parts:
+            idx = parts.index("via")
+            if idx + 1 < len(parts):
+                return parts[idx + 1]
+    return None
+
+
+def tcp_check(target, port, timeout=None):
+    """TCP connect test — works even when ALL ICMP is blocked."""
+    if timeout is None:
+        timeout = TCP_CHECK_TIMEOUT
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        result = sock.connect_ex((target, port))
+        sock.close()
+        return result == 0
+    except Exception:
+        return False
+
+
+# ==========================
+# PING + SMART STATUS
+# ==========================
+
+def ping_target(source_ip, target):
+    """Ping target from a specific source IP. Returns metrics dict."""
     result = {
         "latency_ms_min": None,
         "latency_ms_avg": None,
@@ -99,20 +149,19 @@ def ping_target(iface, target):
         "status": "down",
     }
 
-    cmd = f"ping -q -I {iface} -c {PING_COUNT} -i {PING_INTERVAL} {target}"
+    if not source_ip or not target:
+        return result
+
+    cmd = f"ping -q -I {source_ip} -c {PING_COUNT} -i {PING_INTERVAL} -W {PING_TIMEOUT} {target}"
     out, err, rc = run_cmd(cmd)
 
-    # We can still parse output even if rc != 0 (e.g. some packets lost)
     text = out + "\n" + err
 
-    # Parse loss line:
-    # "10 packets transmitted, 10 received, 0% packet loss, time ..."
     m_loss = re.search(
         r"(\d+)\s+packets transmitted,\s+(\d+)\s+received.*?(\d+)% packet loss",
         text
     )
     if m_loss:
-        tx = int(m_loss.group(1))
         rx = int(m_loss.group(2))
         loss = float(m_loss.group(3))
         result["loss_percent"] = loss
@@ -121,15 +170,11 @@ def ping_target(iface, target):
         else:
             result["status"] = "down"
     else:
-        # If we can't parse, assume 100% loss / down
         return result
 
-    # If 100% loss, we won't have RTT stats
     if result["loss_percent"] == 100.0:
         return result
 
-    # Parse RTT line:
-    # Linux: "rtt min/avg/max/mdev = 13.813/15.219/18.594/1.428 ms"
     m_rtt = re.search(
         r"rtt min/avg/max/(?:mdev|stddev) = ([\d\.]+)/([\d\.]+)/([\d\.]+)/([\d\.]+) ms",
         text
@@ -142,25 +187,155 @@ def ping_target(iface, target):
 
     return result
 
+
+def check_interface(iface):
+    """
+    Smart SLA check for one interface using fallback chain.
+    Stops at first success — no unnecessary checks.
+
+    Chain:
+      1. Ping gateway        → proves link health
+      2. Ping 8.8.8.8        → proves internet (if gateway ICMP disabled)
+      3. Ping 1.1.1.1        → backup internet check
+      4. TCP connect 8.8.8.8:53 → last resort (all ICMP blocked)
+
+    Returns: (ip_addr, gateway, link_metrics, internet_metrics)
+    """
+    ip_addr = get_iface_ip(iface)
+    gateway = get_gateway(iface)
+
+    link_result = None
+    internet_result = None
+    checked_target = None
+
+    # Step 1: Ping gateway (fastest, tests physical link)
+    if gateway and ip_addr:
+        gw_ping = ping_target(ip_addr, gateway)
+        if gw_ping["status"] == "up":
+            link_result = gw_ping
+            checked_target = gateway
+
+    # Step 2+3: Ping internet targets (only if gateway failed or absent)
+    if not link_result and ip_addr:
+        for target in INTERNET_TARGETS:
+            inet_ping = ping_target(ip_addr, target)
+            if inet_ping["status"] == "up":
+                link_result = inet_ping      # link proven UP via internet
+                internet_result = inet_ping
+                checked_target = target
+                break
+
+    # Step 4: TCP fallback (only if ALL pings failed)
+    if not link_result:
+        if tcp_check(TCP_FALLBACK[0], TCP_FALLBACK[1]):
+            link_result = {
+                "latency_ms_min": None, "latency_ms_avg": None,
+                "latency_ms_max": None, "jitter_ms": None,
+                "loss_percent": 0.0, "status": "up",
+            }
+            internet_result = link_result
+            checked_target = f"{TCP_FALLBACK[0]}:{TCP_FALLBACK[1]}"
+
+    # Step 5: All failed — link is genuinely down
+    if not link_result:
+        link_result = {
+            "latency_ms_min": None, "latency_ms_avg": None,
+            "latency_ms_max": None, "jitter_ms": None,
+            "loss_percent": 100.0, "status": "down",
+        }
+        checked_target = gateway or INTERNET_TARGETS[0]
+
+    # If link came up via gateway, optionally check internet too
+    # (only adds one ping when gateway succeeded — lightweight)
+    if link_result["status"] == "up" and internet_result is None and ip_addr:
+        inet_ping = ping_target(ip_addr, INTERNET_TARGETS[0])
+        internet_result = inet_ping
+
+    if internet_result is None:
+        internet_result = {
+            "latency_ms_avg": None, "loss_percent": 100.0, "status": "down",
+        }
+
+    return ip_addr, gateway, checked_target, link_result, internet_result
+
+
+def check_all_interfaces(interfaces):
+    """Check all interfaces in parallel."""
+    results = {}
+
+    with ThreadPoolExecutor(max_workers=min(len(interfaces), 10)) as pool:
+        futures = {
+            pool.submit(check_interface, iface): iface
+            for iface in interfaces
+        }
+        for future in as_completed(futures, timeout=SUBPROCESS_TIMEOUT * 2):
+            iface = futures[future]
+            try:
+                results[iface] = future.result()
+            except Exception:
+                results[iface] = (None, None, None,
+                    {"latency_ms_min": None, "latency_ms_avg": None,
+                     "latency_ms_max": None, "jitter_ms": None,
+                     "loss_percent": 100.0, "status": "error"},
+                    {"latency_ms_avg": None, "loss_percent": 100.0, "status": "error"})
+
+    return results
+
+
+# ==========================
+# STATE FILE (fast boot recovery)
+# ==========================
+
+def read_state(iface_name):
+    """Read uptime/downtime counters from small state file."""
+    state_file = f"{STATE_DIR}/{iface_name}_state.json"
+    try:
+        with open(state_file) as f:
+            state = json.load(f)
+        return (
+            int(state.get("downtime", 0)),
+            int(state.get("uptime", 0)),
+            int(state.get("start_time", 0))
+        )
+    except (FileNotFoundError, json.JSONDecodeError, ValueError):
+        return 0, 0, 0
+
+
+def write_state(iface_name, downtime, uptime, start_time):
+    """Write uptime/downtime counters to small state file (~50 bytes)."""
+    state_file = f"{STATE_DIR}/{iface_name}_state.json"
+    try:
+        with open(state_file, "w") as f:
+            json.dump({
+                "downtime": downtime,
+                "uptime": uptime,
+                "start_time": start_time
+            }, f)
+    except Exception as e:
+        print(f"Error writing state for {iface_name}: {e}", file=sys.stderr)
+
+
+# ==========================
+# CSV + JSON OUTPUT
+# ==========================
+
 def save_json_to_tmp(payload):
     """Save the final 3-minute JSON bundle to /tmp."""
-    #print("Inside the save to file....")
     try:
-        path = "/tmp/ping_metrics.json"     # final json data append into this file.
+        path = "/tmp/ping_metrics.json"
         with open(path, "w") as f:
             json.dump(payload, f, indent=2)
-        #print(f"Saved JSON to {path}")
     except Exception as e:
         print(f"Error saving JSON: {e}", file=sys.stderr)
 
-#===========================
-# SAVE DATA INTO CSV FILE
-#===========================
+
 def save_data_into_csv(sample, interface_name):
-    #------- This part store the 1min interval data into csv file.---------
+    """Append one row per interface to its CSV file."""
     fieldnames = [
         "timestamp", "interface", "target", "destination",
-        "latency_ms", "jitter_ms", "loss_percent", "status", "uptime", "downtime"
+        "latency_ms", "jitter_ms", "loss_percent", "status",
+        "internet_status", "internet_latency_ms", "internet_loss_percent",
+        "uptime", "downtime"
     ]
 
     filename = f"{CSV_DIR}/{interface_name}.csv"
@@ -177,186 +352,140 @@ def save_data_into_csv(sample, interface_name):
             row.update(metrics)
             writer.writerow(row)
 
-#===========================
-# Read Downtime From CSV
-#===========================
-def read_downtime_from_csv(iface_name):
-    filename = f"{CSV_DIR}/{iface_name}.csv"
 
-    if not os.path.exists(filename):
-        return 0, 0, 0
-    
-    last_row = None
-    first_row = None
-
-    with open(filename, newline="") as f:
-        reader = csv.DictReader(f)
-        first_row = next(reader, None)   # get first data row
-        for row in reader:
-            last_row = row
-    
-    if not first_row:
-        return 0, 0, 0
-    
-    start_time = int(first_row.get("timestamp", 0) or 0)
-
-    if last_row is not None:
-        downtime = int(last_row.get("downtime") or 0)
-        uptime = int(last_row.get("uptime") or 0)
-        #print("Last downtime:", downtime)
-    else:
-        #print("CSV is empty")
-        downtime = 0
-        uptime = 0
-        start_time = 0
-    return downtime,uptime,start_time
-
-
-#=================================
-# on day change delete the file.
-#=================================
-def maybe_daily_reset(csv_path):
+def maybe_daily_reset(iface_name):
+    """At 23:59, delete CSV + state for fresh next day."""
     now = datetime.now()
-    hour = now.hour
-    minute = now.minute
-
-    if hour == 23 and minute == 59:
+    if now.hour == 23 and now.minute == 59:
+        csv_path = f"{CSV_DIR}/{iface_name}.csv"
+        state_path = f"{STATE_DIR}/{iface_name}_state.json"
         if os.path.exists(csv_path):
-            os.remove(csv_path)   # delete yesterday file
+            os.remove(csv_path)
+        if os.path.exists(state_path):
+            os.remove(state_path)
+        return True
+    return False
 
-        return 0  # downtime reset to zero
-
-    return None  # no reset
 
 # ==========================
 # MAIN LOOP
-# ==========================    
+# ==========================
+
 def main():
-    global DownTime,UpTime,Availability_Percent,prev_downtime,DataCapture_Counter
+    data_capture_counter = 1
 
     interfaces = get_eth_interfaces()
     if not interfaces:
-        print("No eth* interfaces with IPv4 found.", file=sys.stderr)
+        print("No eth* interfaces found.", file=sys.stderr)
         return
 
-    # print(f"Monitoring interfaces:- {interfaces}")
-    # print(f"Sample interval: {INTERVAL_SECONDS} seconds")
-    # print(f"Bundle size: {SAMPLES_PER_SEND} samples (3 minutes total)")
+    while running:
+        try:
+            loop_start = time.time()
+            timestamp = int(loop_start)
 
-    samples_buffer = []
+            # Refresh interfaces each loop (in case iface added/removed)
+            interfaces = get_eth_interfaces()
+            if not interfaces:
+                time.sleep(INTERVAL_SECONDS)
+                continue
 
-    while True:
-        loop_start = time.time()
-        timestamp = int(loop_start)
+            # Check all WANs in parallel (smart fallback chain per interface)
+            check_results = check_all_interfaces(interfaces)
 
-        # refresh interfaces list each loop (in case iface added/removed)
-        interfaces = get_eth_interfaces()
-
-        #---- below array and dict used to save sample json data.-----------
-        json_file_sample = []
-        sample = {
-            "timestamp": timestamp,
-            "ifaces": {}
-        }
-
-        for iface in interfaces:
-            sample["ifaces"].clear()               # reset for next interval
-            sample["timestamp"] = timestamp
-
-            # 3. Get IP if present (optional)
-            ip_out, _, _ = run_cmd(f"ip -o -4 addr |grep -i {iface}")
-            ip_addr = None
-            if ip_out:
-                parts = ip_out.split()
-                if len(parts) >= 4:
-                    ip_addr = parts[3].split("/")[0]
-
-            #print(f"ip address of {iface} ---> {ip_addr}")
-            #---- this will bring the ping stats --------------
-            ping_stats = ping_target(ip_addr, DEFAULT_PING_FALLBACK)
-
-            #---- check end of the day time to reset the variable values and check the down time from file and read it then calculate---------
-            csv_file = f"{CSV_DIR}/{iface}.csv"
-            reset_dt = maybe_daily_reset(csv_file)
-            if reset_dt is not None:
-                DownTime = 0
-                UpTime = 0
-                Start_Time = 0
-            else:
-                DownTime, UpTime, Start_Time = read_downtime_from_csv(iface)
-
-            # Increment only on 100% loss
-            if ping_stats["loss_percent"] == 100:
-                DownTime += INTERVAL
-            else:
-                UpTime += INTERVAL
-
-            # Availability calculation
-            #print(f"uptime --> {UpTime} and downtime ==> {DownTime}")
-            Availability_Percent = UpTime / (UpTime + DownTime) * 100
-            Availability_Percent = round(Availability_Percent, 2)       #this will save two decimal value.
-            #print(f"--- Time and percentage --> {Availability_Time},{Availability_Percent}")
-
-            # Build iface JSON exactly in your desired format
-            iface_entry = {
-                "target": ip_addr,
-                "destination": DEFAULT_PING_FALLBACK, 
-                "latency_ms": ping_stats["latency_ms_avg"], # average latency in ms
-                "jitter_ms": ping_stats["jitter_ms"],
-                "loss_percent": ping_stats["loss_percent"],
-                "status": ping_stats["status"],  # "up" or "down"
-                "uptime": UpTime,
-                "downtime": DownTime
-            }
-
-            # Build iface JSON exactly in your desired format
-            json_file_entry = {
-                "device_name": iface,
-                "target": ip_addr,
-                "destination": DEFAULT_PING_FALLBACK, 
-                "latency_ms": ping_stats["latency_ms_avg"], # average latency in ms
-                "jitter_ms": ping_stats["jitter_ms"],
-                "packet_loss": ping_stats["loss_percent"],
-                "status": ping_stats["status"],  # "up" or "down"
-                "start time": Start_Time,
-                "uptime_sec": UpTime,
-                "downtime_sec": DownTime,
-                "availability_percent":Availability_Percent
-            }
-
-            sample["ifaces"][iface] = iface_entry
-
-            #--- call this function to save the data into file. -------
-            save_data_into_csv(sample, iface)
-
-            #--- capture data after SAMPLES_PER_SEND reach ------------
-            if DataCapture_Counter == SAMPLES_PER_SEND:
-                #print(f" to capture the json data counter ---> {DataCapture_Counter}")
-                json_file_sample.append(json_file_entry)
-
-        # If buffer full, send 3-minute window
-        if DataCapture_Counter == SAMPLES_PER_SEND:
-            # Save JSON bundle in /tmp/
-            save_json_to_tmp(json_file_sample)
-
-            # After sending, clear buffer to avoid resending same samples.
             json_file_sample = []
-            DataCapture_Counter = 0
 
-        # Sleep until next 1-minute tick
-        loop_end = time.time()
-        elapsed = loop_end - loop_start
-        sleep_time = INTERVAL_SECONDS - elapsed
-        if sleep_time > 0:
-            time.sleep(sleep_time)
-            DataCapture_Counter += 1
+            for iface in interfaces:
+                ip_addr, gateway, checked_target, link_stats, inet_stats = \
+                    check_results.get(iface, (None, None, None,
+                        {"latency_ms_avg": None, "jitter_ms": None,
+                         "loss_percent": 100.0, "status": "error"},
+                        {"latency_ms_avg": None, "loss_percent": 100.0, "status": "error"}))
 
+                # Daily reset check
+                if maybe_daily_reset(iface):
+                    down_time = 0
+                    up_time = 0
+                    start_time = 0
+                else:
+                    down_time, up_time, start_time = read_state(iface)
+
+                # Set start_time on first measurement of the day
+                if start_time == 0:
+                    start_time = timestamp
+
+                # Increment counters based on LINK status (not internet)
+                if link_stats["status"] in ("up",):
+                    up_time += INTERVAL
+                else:
+                    down_time += INTERVAL
+
+                # Availability calculation
+                total_time = up_time + down_time
+                availability_percent = round((up_time / total_time * 100), 2) if total_time > 0 else 0.0
+
+                # Save state
+                write_state(iface, down_time, up_time, start_time)
+
+                # Build CSV sample
+                sample = {
+                    "timestamp": timestamp,
+                    "ifaces": {
+                        iface: {
+                            "target": ip_addr,
+                            "destination": checked_target or gateway or INTERNET_TARGETS[0],
+                            "latency_ms": link_stats.get("latency_ms_avg"),
+                            "jitter_ms": link_stats.get("jitter_ms"),
+                            "loss_percent": link_stats["loss_percent"],
+                            "status": link_stats["status"],
+                            "internet_status": inet_stats.get("status", "unknown"),
+                            "internet_latency_ms": inet_stats.get("latency_ms_avg"),
+                            "internet_loss_percent": inet_stats.get("loss_percent", 100.0),
+                            "uptime": up_time,
+                            "downtime": down_time
+                        }
+                    }
+                }
+                save_data_into_csv(sample, iface)
+
+                # Build JSON entry for 3-minute bundle
+                if data_capture_counter == SAMPLES_PER_SEND:
+                    json_file_sample.append({
+                        "device_name": iface,
+                        "target": ip_addr,
+                        "destination": checked_target or gateway or INTERNET_TARGETS[0],
+                        "gateway": gateway,
+                        "latency_ms": link_stats.get("latency_ms_avg"),
+                        "jitter_ms": link_stats.get("jitter_ms"),
+                        "packet_loss": link_stats["loss_percent"],
+                        "status": link_stats["status"],
+                        "internet_status": inet_stats.get("status", "unknown"),
+                        "internet_latency_ms": inet_stats.get("latency_ms_avg"),
+                        "internet_loss_percent": inet_stats.get("loss_percent", 100.0),
+                        "start time": start_time,
+                        "uptime_sec": up_time,
+                        "downtime_sec": down_time,
+                        "availability_percent": availability_percent
+                    })
+
+            # Send 3-minute bundle
+            if data_capture_counter == SAMPLES_PER_SEND:
+                save_json_to_tmp(json_file_sample)
+                data_capture_counter = 0
+
+            # Sleep until next tick
+            elapsed = time.time() - loop_start
+            sleep_time = INTERVAL_SECONDS - elapsed
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+            data_capture_counter += 1
+
+        except Exception as e:
+            print(f"Error in main loop: {e}", file=sys.stderr)
+            time.sleep(5)
 
 
 if __name__ == "__main__":
-    try:
-        os.makedirs(CSV_DIR, exist_ok=True)
-        main()
-    except KeyboardInterrupt:
-        print("Exiting on Ctrl+C")
-
+    os.makedirs(CSV_DIR, exist_ok=True)
+    os.makedirs(STATE_DIR, exist_ok=True)
+    main()
