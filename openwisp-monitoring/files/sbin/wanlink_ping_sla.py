@@ -16,7 +16,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # ==========================
 
 INTERVAL_SECONDS = 60          # measurement period (1 min)
-SAMPLES_PER_SEND = 3           # send every 3 samples (3 min)
+SAMPLES_PER_SEND = 1           # send every 3 samples (3 min)
 PING_COUNT = 10                # number of ping packets per run
 PING_INTERVAL = 0.2            # interval between ping packets (sec)
 PING_TIMEOUT = 2               # max wait per packet reply (sec) — covers satellite links
@@ -449,7 +449,7 @@ def main():
                 save_data_into_csv(sample, iface)
 
                 # Build JSON entry for 3-minute bundle
-                if data_capture_counter == SAMPLES_PER_SEND:
+                if datetime.now().minute % SAMPLES_PER_SEND == 0:
                     json_file_sample.append({
                         "device_name": iface,
                         "target": ip_addr,
@@ -469,13 +469,13 @@ def main():
                     })
 
             # Send 3-minute bundle
-            if data_capture_counter == SAMPLES_PER_SEND:
+            if datetime.now().minute % SAMPLES_PER_SEND == 0:
                 save_json_to_tmp(json_file_sample)
                 data_capture_counter = 0
 
             # Sleep until next tick
             elapsed = time.time() - loop_start
-            sleep_time = INTERVAL_SECONDS - elapsed
+            next_tick = (int(time.time()) // INTERVAL_SECONDS + 1) * INTERVAL_SECONDS; sleep_time = next_tick - time.time()
             if sleep_time > 0:
                 time.sleep(sleep_time)
             data_capture_counter += 1
@@ -489,3 +489,4 @@ if __name__ == "__main__":
     os.makedirs(CSV_DIR, exist_ok=True)
     os.makedirs(STATE_DIR, exist_ok=True)
     main()
+

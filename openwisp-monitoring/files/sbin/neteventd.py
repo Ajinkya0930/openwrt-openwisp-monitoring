@@ -224,6 +224,9 @@ def netjson_sender():
 
     while True:
         time.sleep(1)
+        # Wall-clock alignment: only consider flushing at :00 second boundaries
+        if int(time.time()) % MIN_FLUSH_INTERVAL != 0:
+            continue
 
         with QUEUE_LOCK:
             if not EVENT_QUEUE:
@@ -543,3 +546,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

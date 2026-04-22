@@ -124,7 +124,7 @@ save_data() {
 		# get process id of the process sending data
 		pid=$(pgrep -f "openwisp-monitoring.*--mode send" | head -n 1)
 		kill -SIGUSR1 "$pid"
-		sleep "$INTERVAL"
+		now=$(date +%s); next=$(( (now / INTERVAL + 1) * INTERVAL )); sleep_time=$(( next - now )); [ $sleep_time -gt 0 ] && sleep $sleep_time
 	done
 }
 
@@ -408,5 +408,6 @@ main() {
 }
 
 main "$@"
+
 
 
