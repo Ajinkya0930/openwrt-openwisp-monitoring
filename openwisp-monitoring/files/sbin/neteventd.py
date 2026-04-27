@@ -80,54 +80,29 @@ MAX_QUEUE_SIZE = 500
 
 # --- Config files to watch ---
 WATCH_FILES = {
-    # Network
+    # Network — interface/IP/route changes
     "/etc/config/network":        "NETWORK",
     "/etc/config/dhcp":           "NETWORK",
     "/etc/config/mwan3":          "NETWORK",
     "/etc/config/ns-failover":    "NETWORK",
-    "/etc/config/lldpd":          "NETWORK",
-    "/etc/config/igmpproxy":      "NETWORK",
-    "/etc/config/ddns":           "NETWORK",
-    "/etc/config/jool":           "NETWORK",
     # Routing
     "/etc/config/frr":            "ROUTING",
     "/etc/config/pbr":            "ROUTING",
     "/etc/config/vrf":            "ROUTING",
-    "/etc/config/ptl_route":      "ROUTING",
-    # SD-WAN
+    # SD-WAN bonding
     "/etc/config/ns-bonding":     "SDWAN",
     "/etc/config/nsbond":         "SDWAN",
-    # Firewall
+    # Firewall — security perimeter
     "/etc/config/firewall":       "FIREWALL",
-    # Security
-    "/etc/config/banip":          "SECURITY",
-    "/etc/config/adblock":        "SECURITY",
-    "/etc/config/dpi":            "SECURITY",
-    "/etc/config/dpi_rule":       "SECURITY",
-    "/etc/config/snort":          "SECURITY",
-    "/etc/config/clamav":         "SECURITY",
-    "/etc/config/squid":          "SECURITY",
-    "/etc/config/ns-webfilter":   "SECURITY",
-    "/etc/config/dnsdist":        "DNS",
-    # VPN
+    # VPN — tunnel state
     "/etc/config/openvpn":        "VPN",
     "/etc/config/ipsec":          "VPN",
-    "/etc/config/ipsecrw":        "VPN",
     "/etc/config/wgrw":           "VPN",
     "/etc/config/l2tp_server":    "VPN",
     "/etc/config/zerotier":       "VPN",
-    "/etc/config/eoip":           "VPN",
-    "/etc/config/vxlan":          "VPN",
-    # QoS
-    "/etc/config/qos":            "QOS",
-    "/etc/config/qosify":         "QOS",
-    "/etc/config/sqm":            "QOS",
-    "/etc/config/trafficshaper":  "QOS",
-    # HA
+    # HA — master/backup transitions
     "/etc/config/keepalived":     "HA",
     "/etc/config/vrrp":           "HA",
-    # Monitoring / System
-    "/etc/config/snmpd":          "SYSTEM",
 }
 
 # ======================== STATE ========================
