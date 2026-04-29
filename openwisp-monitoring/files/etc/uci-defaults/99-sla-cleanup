@@ -1,0 +1,8 @@
+#!/bin/sh
+# Wipe SLA CSVs and state files left on persistent storage.
+# /mnt/storage/sla survives factory reset; /tmp/sla is wiped at boot anyway.
+# uci-defaults runs once on first boot (also after factory reset).
+rm -f /mnt/storage/sla/*.csv /mnt/storage/sla/*_state.json 2>/dev/null
+rm -f /tmp/sla/*.csv         /tmp/sla/*_state.json         2>/dev/null
+exit 0
+

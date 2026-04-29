@@ -9,7 +9,7 @@ PKG_NAME:=openwisp-monitoring
 PKG_VERSION:=$(shell cat ../VERSION)
 PKG_RELEASE:=1
 PKG_BUILD_DIR:=$(BUILD_DIR)/$(PKG_NAME)/$(PKG_SOURCE_SUBDIR)
-PKG_MAINTAINER:=Federico Capoano <f.capoano@openwisp.io>
+PKG_MAINTAINER:=Ajinkya Jadhav <ajinkya.j@nexapp.co.in>
 PKG_LICENSE:=GPL-3.0-or-later
 
 include $(INCLUDE_DIR)/package.mk
@@ -105,7 +105,8 @@ define Package/openwisp-monitoring/install
 		$(1)/usr/lib/openwisp-monitoring \
 		$(1)/etc/hotplug.d/openwisp \
 		$(1)/etc/hotplug.d/iface \
-		$(1)/etc/hotplug.d/net
+		$(1)/etc/hotplug.d/net \
+		$(1)/etc/uci-defaults
 
 	$(INSTALL_BIN) \
 		files/monitoring.agent \
@@ -150,6 +151,10 @@ define Package/openwisp-monitoring/install
 	$(INSTALL_BIN) \
 		files/etc/hotplug.d/98-netevent.net \
 		$(1)/etc/hotplug.d/net/98-netevent
+
+	$(INSTALL_BIN) \
+		files/etc/uci-defaults/99-sla-cleanup \
+		$(1)/etc/uci-defaults/99-sla-cleanup
 endef
 
 $(eval $(call BuildPackage,openwisp-monitoring))
